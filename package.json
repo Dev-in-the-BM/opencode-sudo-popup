@@ -1,0 +1,41 @@
+{
+  "name": "opencode-sudo-popup",
+  "version": "1.0.0",
+  "description": "Shows a desktop GUI popup when opencode needs sudo, so you know exactly what command requires root before typing your password.",
+  "author": "Uvindu Sankalpa",
+  "license": "MIT",
+  "type": "module",
+  "main": "src/index.js",
+  "files": [
+    "src",
+    "bin",
+    "scripts",
+    "LICENSE",
+    "README.md"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/uvindusl/opencode-sudo-popup.git"
+  },
+  "bugs": {
+    "url": "https://github.com/uvindusl/opencode-sudo-popup/issues"
+  },
+  "homepage": "https://github.com/uvindusl/opencode-sudo-popup#readme",
+  "scripts": {
+    "postinstall": "node scripts/install.js"
+  },
+  "keywords": [
+    "opencode",
+    "plugin",
+    "sudo",
+    "popup",
+    "prompt",
+    "zenity",
+    "gui",
+    "askpass",
+    "permission"
+  ],
+  "dependencies": {
+    "@opencode-ai/plugin": "^1.17.0"
+  }
+}
