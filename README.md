@@ -62,10 +62,24 @@ Just use opencode normally. Any time it needs root, a branded dialog appears:
 └────────────────────────────────────────────────────────┘
 ```
 
+The dialog has two separated sections so a malicious command can never
+impersonate the explanation:
+
+- **Why this is needed** — a plain-language sentence inferred offline from
+  the command itself (e.g. `sudo apt install -y nginx` →
+  "Installing the system package “nginx”."). Only describes what the
+  command *does* using tokens actually present — never guesses user
+  intent. Unknown commands get an honest generic line.
+- **Command that will run** — the isolated monospace command block.
+
 The window title stays constant (so it's recognizable and never
-truncated); the command is shown in the dialog body in monospace.
-Backends: `zenity` (rich Pango text) → `yad` (icon + labeled buttons) →
-`kdialog` (plain text + icon) → `qarma` → terminal fallback.
+truncated). Backends: `zenity` (rich Pango text) → `yad` (icon + labeled
+buttons) → `kdialog` (plain text + icon) → `qarma` → terminal fallback.
+
+The plugin writes JSON (`{command, purpose, ts}`) to the shared
+reason file; the helper reads it with `python3` (falls back to best-effort
+parsing, then to old flat-string files). A 120-second staleness guard
+distrusts the purpose of outdated files while still showing the command.
 
 ## What it catches
 
