@@ -113,14 +113,26 @@ app.connect("activate", () => {
   const cmdFrame = new Gtk.Frame();
   cmdFrame.add_css_class("view");
   cmdFrame.set_margin_top(4);
-  const cmdBox = new Gtk.Box({ orientation: Gtk.Orientation.VERTICAL, spacing: 8, margin_top: 10, margin_bottom: 10, margin_start: 12, margin_end: 12 });
-  const cmdLabel = labelMarkup(escapeMarkup(command), "monospace");
-  cmdBox.append(cmdLabel);
-  if (device) {
-    cmdBox.append(labelMarkup(escapeMarkup(`in ${device}`), "dim-label"));
-  }
-  cmdFrame.set_child(cmdBox);
+  // Read-only selectable monospace TextView — renders reliably regardless
+  // of theme and lets the user copy the command.
+  const tv = new Gtk.TextView({
+    editable: false,
+    cursor_visible: false,
+    monospace: true,
+    wrap_mode: Gtk.WrapMode.WORD,
+    left_margin: 12,
+    right_margin: 12,
+    top_margin: 10,
+    bottom_margin: 10,
+  });
+  tv.get_buffer().set_text(command, -1);
+  cmdFrame.set_child(tv);
   content.append(cmdFrame);
+  if (device) {
+    const devLbl = labelMarkup(escapeMarkup(`${device}`), "dim-label");
+    devLbl.set_margin_top(6);
+    content.append(devLbl);
+  }
 
   // warning + password row
   const warn = labelMarkup("⚠ This grants full root access for this command only. Cancel if this looks unexpected.", "dim-label");
