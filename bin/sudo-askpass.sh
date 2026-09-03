@@ -108,8 +108,12 @@ Command that will run:
 Enter your password to allow this once (Cancel if unexpected)."
 
 # --- Backends (fastest/most native first) ---------------------------------
+# NOTE: stock `zenity --password` silently IGNORES --text (it always shows
+# the default "Type your password" prompt), so we use --entry --hide-text
+# instead — same askpass contract (prints entry on OK/exit 0, nothing on
+# Cancel/exit 1) but actually renders our Why+What body.
 if command -v zenity >/dev/null 2>&1; then
-  exec zenity --password \
+  exec zenity --entry --hide-text \
     --title="$TITLE" \
     --text="$ZENITY_TEXT" \
     --window-icon=dialog-password \
@@ -133,8 +137,8 @@ elif command -v kdialog >/dev/null 2>&1; then
     --password "$PLAIN_TEXT" 2>/dev/null
 
 elif command -v qarma >/dev/null 2>&1; then
-  # qarma is a Qt zenity clone — same flags.
-  exec qarma --password \
+  # qarma is a Qt zenity clone — same --password limitation, same workaround.
+  exec qarma --entry --hide-text \
     --title="$TITLE" \
     --text="$ZENITY_TEXT" \
     --window-icon=dialog-password \
