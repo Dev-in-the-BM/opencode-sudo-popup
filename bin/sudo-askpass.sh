@@ -108,6 +108,13 @@ Command that will run:
 Enter your password to allow this once (Cancel if unexpected)."
 
 # --- Backends (fastest/most native first) ---------------------------------
+# Preferred: modern Adwaita dialog via GJS + GTK4/libadwaita (native on GNOME).
+# Prints password to stdout on OK, exit 1 on Cancel — same askpass contract.
+GJS_DIALOG="$(dirname "$0")/sudo-askpass-gjs.js"
+if command -v gjs >/dev/null 2>&1 && [[ -f "$GJS_DIALOG" ]]; then
+  exec gjs "$GJS_DIALOG" 2>/dev/null
+fi
+
 # NOTE: stock `zenity --password` silently IGNORES --text (it always shows
 # the default "Type your password" prompt), so we use --entry --hide-text
 # instead — same askpass contract (prints entry on OK/exit 0, nothing on

@@ -17,7 +17,9 @@ When opencode runs `sudo apt install foo`, you're asked for a password with no i
 ## Requirements
 
 - Linux with `sudo`
-- A GUI auth dialog — any of: `zenity` (GNOME), `yad`, `kdialog` (KDE), `qarma` (LXQt). If none exist, it falls back to a plain terminal password prompt.
+- Display server (Wayland or X11)
+- **Recommended:** GJS + GTK4 + libadwaita (native on GNOME) for the full modern Adwaita dialog with a proper password field, monospace command block, and eye-peek toggle.
+- Falls back automatically, in order: `zenity` → `yad` → `kdialog` → `qarma`, then a plain terminal password prompt if no GUI tool exists.
 
 ## Install
 
@@ -73,8 +75,15 @@ impersonate the explanation:
 - **Command that will run** — the isolated monospace command block.
 
 The window title stays constant (so it's recognizable and never
-truncated). Backends: `zenity` (rich Pango text) → `yad` (icon + labeled
-buttons) → `kdialog` (plain text + icon) → `qarma` → terminal fallback.
+truncated).
+
+## Backends
+
+The helper prefers a native **GJS + GTK4 + libadwaita** dialog (`Adw.Window`
+with a `PasswordEntryRow`), which renders a genuine Adwaita UI with a
+security icon, styled Why/What sections, a code-style command block, and an
+eye-peek password field. It degrades gracefully to `zenity` → `yad` →
+`kdialog` → `qarma` → terminal if GJS/GTK4 are unavailable.
 
 The plugin writes JSON (`{command, purpose, ts}`) to the shared
 reason file; the helper reads it with `python3` (falls back to best-effort
