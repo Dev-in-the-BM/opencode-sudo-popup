@@ -199,10 +199,16 @@ async function writeReason(cmd) {
   }
 }
 
+// Never treat our own plumbing as a sudo request: commands that reference
+// the reason file or the askpass helper (self-tests, setup, diagnostics)
+// must not overwrite the very reason they are trying to inspect.
+const SELF_RE = /opencode-sudo-reason|sudo-askpass/i
+
 export default async () => ({
   "tool.execute.before": async (input, output) => {
     if (input.tool !== "bash") return
     const cmd = String(output.args?.command ?? "")
+    if (SELF_RE.test(cmd)) return
     if (!containsSudo(cmd)) return
     await writeReason(cmd)
   },
