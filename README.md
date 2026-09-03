@@ -42,16 +42,30 @@ The package's `postinstall` script automatically:
 
 ## Usage
 
-Just use opencode normally. Any time it needs root, a dialog appears:
+Just use opencode normally. Any time it needs root, a branded dialog appears:
 
 ```
-┌──────────────────────────────────────────────┐
-│  Opencode needs SUDO for: sudo apt update    │
-│                                              │
-│  [ --------------------------- ]             │
-│  [             OK              ]             │
-└──────────────────────────────────────────────┘
+┌─ Opencode — Administrator access required ─────────────┐
+│  🔒 Opencode wants administrative access                │
+│                                                        │
+│  An AI-assisted action requested root privileges.      │
+│  Review before authenticating:                         │
+│                                                        │
+│    sudo apt update                                     │
+│                                                        │
+│  ⚠ This grants full root access for this command       │
+│  only. Cancel if this looks unexpected.                │
+│                                                        │
+│  Password: [ **************** ]                        │
+│                                                        │
+│                    [ Cancel ]  [ Authenticate ]         │
+└────────────────────────────────────────────────────────┘
 ```
+
+The window title stays constant (so it's recognizable and never
+truncated); the command is shown in the dialog body in monospace.
+Backends: `zenity` (rich Pango text) → `yad` (icon + labeled buttons) →
+`kdialog` (plain text + icon) → `qarma` → terminal fallback.
 
 ## What it catches
 
