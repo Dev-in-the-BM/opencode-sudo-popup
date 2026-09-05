@@ -1,149 +1,83 @@
 #!/usr/bin/env gjs
-// opencode-sudo-popup — modern Adwaita askpass dialog (GJS + GTK4 + libadwaita).
-// Contract (identical to shell askpass): prints password to stdout on
-// Authenticate, exits 1 on Cancel. Reads context from /tmp/opencode-sudo-reason.
-//
-// The reason file may be JSON {"command","purpose","ts"} written by the opencode
-// plugin, or a legacy flat string (whole content = command, no purpose).
+// opencode-sudo-popup — minimal askpass dialog (GJS + GTK4 + libadwaita).
+// Compact: shows the command opencode is about to run + a password field.
+// Contract: prints password to stdout on OK, exit 1 on Cancel.
+// Reads context from /tmp/opencode-sudo-reason (JSON or legacy flat string).
 
 imports.gi.versions.Gtk = "4.0";
 imports.gi.versions.Adw = "1";
-const { Gtk, Gdk, GLib, Adw } = imports.gi;
+const { Gtk, GLib, Adw } = imports.gi;
 
 const REASON = "/tmp/opencode-sudo-reason";
-const TITLE = "Opencode — Administrator access required";
+const TITLE = "Sudo required";
 
-// ---------- read + sanitize context (JSON with flat-string fallback) ---------
 function readCommand() {
-  let file;
   try {
-    file = GLib.file_new_for_path(REASON);
-    if (!file.query_exists(null)) return { command: "", device: "" };
+    const file = GLib.file_new_for_path(REASON);
+    if (!file.query_exists(null)) return "";
     const [, content] = file.load_contents(null);
-    return parseContext(new TextDecoder().decode(content));
-  } catch {
-    return { command: "", device: "" };
-  }
-}
-
-function parseContext(raw) {
-  const s = (raw || "").trim();
-  if (s.startsWith("{")) {
-    try {
-      const d = JSON.parse(s);
-      const command = oneLine(d.command || "").slice(0, 300);
-      const purpose = oneLine(d.purpose || "");
-      return { command, purpose, device: oneLine(d.device || "") };
-    } catch {
-      // fall through to best-effort values
+    const raw = new TextDecoder().decode(content).trim();
+    if (raw.startsWith("{")) {
+      try {
+        return oneLine(JSON.parse(raw).command || "").slice(0, 300);
+      } catch {
+        // fall through
+      }
     }
+    return oneLine(raw).slice(0, 300);
+  } catch {
+    return "";
   }
-  // legacy flat string: whole content is the command
-  return { command: oneLine(raw || "").slice(0, 300), purpose: "", device: "" };
 }
 
 function oneLine(t) {
   return String(t).replace(/\s+/g, " ").trim();
 }
 
-const GENERIC_WHY = "Opencode requested root to run the command below. Only approve if you expected a privileged step.";
-
 // ---------- build UI ----------
 Adw.init();
-Gtk.init();
 
-const { command, purpose, device } = readCommand();
-const why = purpose || GENERIC_WHY;
-
-function labelMarkup(text, cssClass) {
-  const lbl = new Gtk.Label({ label: text, wrap: true, xalign: 0 });
-  lbl.add_css_class(cssClass);
-  return lbl;
-}
+const command = readCommand();
+const display = command || "sudo <unknown command>";
 
 const app = new Gtk.Application();
 let finished = false;
 
 app.connect("activate", () => {
-  // main window (dialog-like)
   const win = new Adw.Window({
     application: app,
     title: TITLE,
     modal: true,
     resizable: false,
-    default_width: 460,
+    default_width: 420,
   });
   win.set_icon_name("dialog-password");
-  win.add_css_class("csd");
-  win.add_css_class("devel");
-  win.add_css_class("background");
 
-  const content = new Gtk.Box({ orientation: Gtk.Orientation.VERTICAL, spacing: 0, margin_top: 24, margin_bottom: 24, margin_start: 24, margin_end: 24 });
+  const content = new Gtk.Box({
+    orientation: Gtk.Orientation.VERTICAL,
+    spacing: 10,
+    margin_top: 16,
+    margin_bottom: 16,
+    margin_start: 16,
+    margin_end: 16,
+  });
   win.set_content(content);
 
-  // header
-  const headerBox = new Gtk.Box({ orientation: Gtk.Orientation.HORIZONTAL, spacing: 16 });
-  content.append(headerBox);
-
-  const icon = new Gtk.Image({ icon_name: "dialog-password", pixel_size: 48 });
-  headerBox.append(icon);
-
-  const headText = new Gtk.Box({ orientation: Gtk.Orientation.VERTICAL, spacing: 2, valign: Gtk.Align.CENTER });
-  const titleLbl = labelMarkup("Opencode wants administrative access", "title-1");
-  titleLbl.wrap = false;
-  headText.append(titleLbl);
-  const subLbl = labelMarkup("Grant root permission to run a single command", "dim-label");
-  headText.append(subLbl);
-  headerBox.append(headText);
-
-  // separator
-  content.append(new Gtk.Separator({ orientation: Gtk.Orientation.HORIZONTAL, margin_top: 16, margin_bottom: 16 }));
-
-  // Why section
-  const whyTitle = labelMarkup("Why this is needed", "heading");
-  content.append(whyTitle);
-  content.append(labelMarkup(escapeMarkup(why), "body"));
-  const whyDivider = new Gtk.Separator({ orientation: Gtk.Orientation.HORIZONTAL, margin_top: 12, margin_bottom: 12 });
-  content.append(whyDivider);
-
-  // Command section
-  const cmdTitle = labelMarkup("Command that will run", "heading");
-  content.append(cmdTitle);
-
-  const cmdFrame = new Gtk.Frame();
-  cmdFrame.add_css_class("view");
-  cmdFrame.set_margin_top(4);
-  // Read-only selectable monospace TextView — renders reliably regardless
-  // of theme and lets the user copy the command.
-  const tv = new Gtk.TextView({
-    editable: false,
-    cursor_visible: false,
-    monospace: true,
-    wrap_mode: Gtk.WrapMode.WORD,
-    left_margin: 12,
-    right_margin: 12,
-    top_margin: 10,
-    bottom_margin: 10,
+  // command label — what opencode is about to run, monospace + wrapped
+  const cmdLbl = new Gtk.Label({
+    label: display,
+    wrap: true,
+    xalign: 0,
+    selectable: true,
+    max_width_chars: 48,
   });
-  tv.get_buffer().set_text(command, -1);
-  cmdFrame.set_child(tv);
-  content.append(cmdFrame);
-  if (device) {
-    const devLbl = labelMarkup(escapeMarkup(`${device}`), "dim-label");
-    devLbl.set_margin_top(6);
-    content.append(devLbl);
-  }
-
-  // warning + password row
-  const warn = labelMarkup("⚠ This grants full root access for this command only. Cancel if this looks unexpected.", "dim-label");
-  warn.set_margin_top(16);
-  content.append(warn);
+  cmdLbl.add_css_class("monospace");
+  cmdLbl.add_css_class("body");
+  content.append(cmdLbl);
 
   const pwRow = new Adw.PasswordEntryRow();
   pwRow.set_title("Password");
   pwRow.set_activates_default(true);
-  pwRow.set_margin_top(8);
-  pwRow.set_margin_bottom(16);
   content.append(pwRow);
 
   const finish = (pw) => {
@@ -153,8 +87,11 @@ app.connect("activate", () => {
     win.close();
   };
 
-  // action buttons
-  const actionBar = new Gtk.Box({ orientation: Gtk.Orientation.HORIZONTAL, spacing: 8, halign: Gtk.Align.END });
+  const actionBar = new Gtk.Box({
+    orientation: Gtk.Orientation.HORIZONTAL,
+    spacing: 8,
+    halign: Gtk.Align.END,
+  });
   content.append(actionBar);
 
   const cancelBtn = new Gtk.Button({ label: "Cancel" });
@@ -168,15 +105,10 @@ app.connect("activate", () => {
   win.set_default_widget(okBtn);
 
   pwRow.connect("activate", () => finish(pwRow.get_text()));
+  pwRow.grab_focus();
 
   win.present();
 });
 
 app.run(null);
-if (!finished) process.exit(1); // window closed without authenticating
-process.exit(0);
-
-// ---------- helpers ----------
-function escapeMarkup(t) {
-  return String(t).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-}
+imports.system.exit(finished ? 0 : 1);
