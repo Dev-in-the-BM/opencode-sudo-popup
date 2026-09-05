@@ -1,10 +1,26 @@
 # opencode-sudo-popup
 
-Shows a **desktop GUI popup** when opencode needs `sudo`, so you know exactly which command requires root *before* typing your password.
+Shows a **compact desktop popup** when opencode needs `sudo`, so you see exactly which command requires root *before* typing your password.
 
-Unlike auto-approve or YOLO plugins, this one **does not** skip or review commands. It simply turns opencode's blind sudo password prompt into a clear, contextual dialog.
+Unlike auto-approve or YOLO plugins, this one **does not** skip or review commands. It simply turns opencode's blind sudo password prompt into a clear dialog.
 
 ![Screenshot placeholder]
+
+## What it looks like
+
+A minimal, compact window — just the command opencode is about to execute and a password field:
+
+```
+┌─ Sudo required ────────────────┐
+│  sudo apt install -y nginx     │
+│                                │
+│  Password  [ •••••••••••••• ]  │
+│                        [Cancel][Authenticate] │
+└────────────────────────────────┘
+```
+
+- The command is shown **monospace**, wrapped, and **selectable** (so you can copy it).
+- Press **Enter** or click **Authenticate** to allow; **Cancel** denies and the command is aborted.
 
 ## Why
 
@@ -12,13 +28,13 @@ When opencode runs `sudo apt install foo`, you're asked for a password with no i
 
 1. Catching the `sudo` command before it runs (via the `tool.execute.before` hook).
 2. Writing a short summary of the *real* command to a temp file.
-3. Pointing `SUDO_ASKPASS` at a helper that reads that file and pops up a GUI password dialog titled with the command.
+3. Pointing `SUDO_ASKPASS` at a helper that reads that file and pops up a GUI password dialog with the command to be run.
 
 ## Requirements
 
 - Linux with `sudo`
 - Display server (Wayland or X11)
-- **Recommended:** GJS + GTK4 + libadwaita (native on GNOME) for the full modern Adwaita dialog with a proper password field, monospace command block, and eye-peek toggle.
+- **Recommended:** GJS + GTK4 + libadwaita (native on GNOME) for the compact native dialog.
 - Falls back automatically, in order: `zenity` → `yad` → `kdialog` → `qarma`, then a plain terminal password prompt if no GUI tool exists.
 
 ## Install
@@ -44,51 +60,13 @@ The package's `postinstall` script automatically:
 
 ## Usage
 
-Just use opencode normally. Any time it needs root, a branded dialog appears:
-
-```
-┌─ Opencode — Administrator access required ─────────────┐
-│  🔒 Opencode wants administrative access                │
-│                                                        │
-│  An AI-assisted action requested root privileges.      │
-│  Review before authenticating:                         │
-│                                                        │
-│    sudo apt update                                     │
-│                                                        │
-│  ⚠ This grants full root access for this command       │
-│  only. Cancel if this looks unexpected.                │
-│                                                        │
-│  Password: [ **************** ]                        │
-│                                                        │
-│                    [ Cancel ]  [ Authenticate ]         │
-└────────────────────────────────────────────────────────┘
-```
-
-The dialog has two separated sections so a malicious command can never
-impersonate the explanation:
-
-- **Why this is needed** — a plain-language sentence inferred offline from
-  the command itself (e.g. `sudo apt install -y nginx` →
-  "Installing the system package “nginx”."). Only describes what the
-  command *does* using tokens actually present — never guesses user
-  intent. Unknown commands get an honest generic line.
-- **Command that will run** — the isolated monospace command block.
-
-The window title stays constant (so it's recognizable and never
-truncated).
+Just use opencode normally. Any time it needs root, the compact dialog appears showing the command to be run. Type your password to allow it once, or Cancel to deny.
 
 ## Backends
 
-The helper prefers a native **GJS + GTK4 + libadwaita** dialog (`Adw.Window`
-with a `PasswordEntryRow`), which renders a genuine Adwaita UI with a
-security icon, styled Why/What sections, a code-style command block, and an
-eye-peek password field. It degrades gracefully to `zenity` → `yad` →
-`kdialog` → `qarma` → terminal if GJS/GTK4 are unavailable.
+The helper prefers a native **GJS + GTK4 + libadwaita** dialog (`Adw.Window` with a `PasswordEntryRow` and monospace command label), which is a tiny single-screen window. It degrades gracefully to `zenity` → `yad` → `kdialog` → `qarma` → terminal if GJS/GTK4 are unavailable.
 
-The plugin writes JSON (`{command, purpose, ts}`) to the shared
-reason file; the helper reads it with `python3` (falls back to best-effort
-parsing, then to old flat-string files). A 120-second staleness guard
-distrusts the purpose of outdated files while still showing the command.
+The plugin writes JSON (`{command, purpose, ts}`) to the shared reason file; the GJS helper reads it directly with `Gio`, and the shell fallbacks parse it with `python3` (both fall back to old flat-string files). A 120-second staleness guard distrusts outdated purpose text while still showing the command.
 
 ## What it catches
 
@@ -97,7 +75,7 @@ It only matches `sudo` used as an actual command (whole word at a command bounda
 ## Development
 
 ```bash
-git clone https://github.com/<you>/opencode-sudo-popup
+git clone https://github.com/uvindusl/opencode-sudo-popup
 cd opencode-sudo-popup
 npm install
 # postinstall wires the askpass helper into ~/.config/opencode.
