@@ -6,14 +6,14 @@
 
 imports.gi.versions.Gtk = "4.0";
 imports.gi.versions.Adw = "1";
-const { Gtk, GLib, Adw } = imports.gi;
+const { Gtk, Gio, Adw } = imports.gi;
 
 const REASON = "/tmp/opencode-sudo-reason";
 const TITLE = "Sudo required";
 
 function readCommand() {
   try {
-    const file = GLib.file_new_for_path(REASON);
+    const file = Gio.File.new_for_path(REASON);
     if (!file.query_exists(null)) return "";
     const [, content] = file.load_contents(null);
     const raw = new TextDecoder().decode(content).trim();
