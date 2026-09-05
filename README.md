@@ -34,8 +34,7 @@ When opencode runs `sudo apt install foo`, you're asked for a password with no i
 
 - Linux with `sudo`
 - Display server (Wayland or X11)
-- **Recommended:** GJS + GTK4 + libadwaita (native on GNOME) for the compact native dialog.
-- Falls back automatically, in order: `zenity` → `yad` → `kdialog` → `qarma`, then a plain terminal password prompt if no GUI tool exists.
+- **Required:** GJS + GTK4 + libadwaita (native on GNOME) for the compact native dialog. Without `gjs` the popup cannot be shown.
 
 ## Install
 
@@ -62,11 +61,11 @@ The package's `postinstall` script automatically:
 
 Just use opencode normally. Any time it needs root, the compact dialog appears showing the command to be run. Type your password to allow it once, or Cancel to deny.
 
-## Backends
+## Backend
 
-The helper prefers a native **GJS + GTK4 + libadwaita** dialog (`Adw.Window` with a `PasswordEntryRow` and monospace command label), which is a tiny single-screen window. It degrades gracefully to `zenity` → `yad` → `kdialog` → `qarma` → terminal if GJS/GTK4 are unavailable.
+The helper uses a native **GJS + GTK4 + libadwaita** dialog (`Adw.Window` with a `PasswordEntryRow` and monospace command label) — a tiny single-screen window. This is the only backend; it prints a clear error if `gjs` is unavailable.
 
-The plugin writes JSON (`{command, purpose, ts}`) to the shared reason file; the GJS helper reads it directly with `Gio`, and the shell fallbacks parse it with `python3` (both fall back to old flat-string files). A 120-second staleness guard distrusts outdated purpose text while still showing the command.
+The plugin writes JSON (`{command, purpose, ts}`) to the shared reason file; the GJS helper reads it with `Gio` (with fallback to old flat-string files). A 120-second staleness guard distrusts outdated purpose text while still showing the command.
 
 ## What it catches
 
