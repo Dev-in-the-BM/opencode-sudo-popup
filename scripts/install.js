@@ -8,17 +8,33 @@ const __dirname = dirname(fileURLToPath(import.meta.url))
 const HOME = homedir()
 const CONFIG_DIR = join(HOME, ".config", "opencode")
 const ASKPASS_DEST = join(CONFIG_DIR, "sudo-askpass.sh")
+const GJS_DEST = join(CONFIG_DIR, "sudo-askpass-gjs.js")
+const PLUGIN_DIR = join(CONFIG_DIR, "plugin")
+const PLUGIN_DEST = join(PLUGIN_DIR, "sudo-reason.js")
 
 const ASKPASS_UNIX = `"${ASKPASS_DEST}"`
 const ASKPASS_ESC = ASKPASS_UNIX.replaceAll('"', '\\"')
 
 async function ensureAskpass() {
   await mkdir(CONFIG_DIR, { recursive: true })
+  // askpass wrapper + its GJS dialog must live side by side in the same dir.
   const src = join(__dirname, "..", "bin", "sudo-askpass.sh")
+  const gjs = join(__dirname, "..", "bin", "sudo-askpass-gjs.js")
   const content = await readFile(src)
+  const gjsContent = await readFile(gjs)
   await writeFile(ASKPASS_DEST, content)
   await chmod(ASKPASS_DEST, 0o755)
+  await writeFile(GJS_DEST, gjsContent)
+  await chmod(GJS_DEST, 0o755)
   return ASKPASS_DEST
+}
+
+async function ensurePlugin() {
+  await mkdir(PLUGIN_DIR, { recursive: true })
+  const src = join(__dirname, "..", "src", "index.js")
+  const content = await readFile(src)
+  await writeFile(PLUGIN_DEST, content)
+  return PLUGIN_DEST
 }
 
 function shellRc(shell) {
@@ -56,6 +72,8 @@ async function ensureEnv() {
 async function main() {
   const ask = await ensureAskpass()
   console.log(`[opencode-sudo-popup] askpass helper -> ${ask}`)
+  const plugin = await ensurePlugin()
+  console.log(`[opencode-sudo-popup] plugin -> ${plugin}`)
   const wired = await ensureEnv()
   if (wired) console.log("[opencode-sudo-popup] SUDO_ASKPASS exported to your shell rc")
 }

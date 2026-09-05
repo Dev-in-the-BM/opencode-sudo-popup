@@ -1,34 +1,8 @@
-# opencode-sudo-popup
+# why opencode-sudo-popup plugin
 
-Shows a **compact desktop popup** when opencode needs `sudo`, so you see exactly which command requires root *before* typing your password.
-
-Unlike auto-approve or YOLO plugins, this one **does not** skip or review commands. It simply turns opencode's blind sudo password prompt into a clear dialog.
-
-![Screenshot placeholder]
-
-## What it looks like
+This is a tool that i built for me because sometime when do my development task with opencode sometime it need some new packages stuff. so the agent telling me to run those commands and stop the agents task. to prevent this i just buit this plugin when the agent need sudo access it can just access it by popup menu and also it shows what is the command that agent run. I think this plugin is usefull for someone that use opencode like me so i thought to publish this thing as a plugin to opencode. 
 
 A minimal, compact window — just the command opencode is about to execute and a password field:
-
-```
-┌─ Sudo required ────────────────┐
-│  sudo apt install -y nginx     │
-│                                │
-│  Password  [ •••••••••••••• ]  │
-│                        [Cancel][Authenticate] │
-└────────────────────────────────┘
-```
-
-- The command is shown **monospace**, wrapped, and **selectable** (so you can copy it).
-- Press **Enter** or click **Authenticate** to allow; **Cancel** denies and the command is aborted.
-
-## Why
-
-When opencode runs `sudo apt install foo`, you're asked for a password with no idea what it's for. This plugin bridges that gap by:
-
-1. Catching the `sudo` command before it runs (via the `tool.execute.before` hook).
-2. Writing a short summary of the *real* command to a temp file.
-3. Pointing `SUDO_ASKPASS` at a helper that reads that file and pops up a GUI password dialog with the command to be run.
 
 ## Requirements
 
@@ -38,22 +12,21 @@ When opencode runs `sudo apt install foo`, you're asked for a password with no i
 
 ## Install
 
+Clone + install + restart opencode:
+
 ```bash
-opencode plugin add opencode-sudo-popup
+git clone https://github.com/uvindusl/opencode-sudo-popup
+cd opencode-sudo-popup
+npm install
 ```
 
-Or add to `opencode.json`:
+The `postinstall` script automatically:
 
-```json
-{
-  "plugin": ["opencode-sudo-popup"]
-}
-```
-
-The package's `postinstall` script automatically:
-
-- Copies the askpass helper to `~/.config/opencode/sudo-askpass.sh` (executable).
+- Copies the askpass helper + GJS dialog to `~/.config/opencode/`.
+- Installs the plugin itself to `~/.config/opencode/plugin/sudo-reason.js`.
 - Adds `export SUDO_ASKPASS=...` to your shell rc file (`~/.zshenv`, `~/.bashrc`, or `~/.config/fish/config.fish` — only if not already set).
+
+> Restart opencode after installing so the plugin is loaded at startup.
 
 > Note: opencode may load your config shell with `sudo` (e.g. `sudo -A`). Ensure `SUDO_ASKPASS` is set in an environment that survives into the `sudo` process. `~/.zshenv` works for zsh. For bash, having it in `~/.bashrc` requires an interactive shell. In non-interactive/fish environments, consider an `alias sudo='sudo -A'` in that shell.
 
