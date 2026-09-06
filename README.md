@@ -1,6 +1,6 @@
-# why opencode-sudo-popup plugin
+# opencode-sudo-popup
 
-This is a tool that i built for me because sometime when do my development task with opencode sometime it need some new packages stuff. so the agent telling me to run those commands and stop the agents task. to prevent this i just buit this plugin when the agent need sudo access it can just access it by popup menu and also it shows what is the command that agent run. I think this plugin is usefull for someone that use opencode like me so i thought to publish this thing as a plugin to opencode. 
+When opencode runs tasks with `sudo`, it often halts mid-work to ask you to run a privileged command manually. This plugin lets opencode request root itself through a native desktop popup — showing exactly which command is about to run — so your workflow isn't interrupted.
 
 A minimal, compact window — just the command opencode is about to execute and a password field:
 
@@ -38,7 +38,7 @@ Just use opencode normally. Any time it needs root, the compact dialog appears s
 
 The helper uses a native **GJS + GTK4 + libadwaita** dialog (`Adw.Window` with a `PasswordEntryRow` and monospace command label) — a tiny single-screen window. This is the only backend; it prints a clear error if `gjs` is unavailable.
 
-The plugin writes JSON (`{command, purpose, ts}`) to the shared reason file; the GJS helper reads it with `Gio` (with fallback to old flat-string files). A 120-second staleness guard distrusts outdated purpose text while still showing the command.
+The plugin writes JSON (`{command, purpose, ts}`) to the shared reason file; the GJS helper reads it with `Gio` (with fallback to old flat-string files).
 
 ## What it catches
 
