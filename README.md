@@ -1,63 +1,122 @@
 # opencode-sudo-popup
 
-When opencode runs tasks with `sudo`, it often halts mid-work to ask you to run a privileged command manually. This plugin lets opencode request root itself through a native desktop popup — showing exactly which command is about to run — so your workflow isn't interrupted.
+A deterministic sudo approval gate for [OpenCode](https://opencode.ai) **V2**.
 
-A minimal, compact window — just the command opencode is about to execute and a password field:
+When opencode needs root, the plugin rewrites the command so it can only run
+through a root-owned gate program. The gate pops up a native **Adwaita**
+dialog showing exactly which command is about to run — click **Allow** and it
+executes as root, click **Deny** (or don't answer) and it's blocked.
+
+No password prompts, no interrupted workflow: every privileged command gets
+one explicit approval — or none.
+
+## How it works
+
+1. The plugin hooks shell execution (`tool.execute.before`). When a command
+   contains a real `sudo` occurrence, it rewrites
+
+   ```
+   sudo apt update   →   sudo /usr/local/bin/opencode-sudo-gate -- apt update
+   ```
+
+   and writes a reason file describing what the command will do.
+2. `/etc/sudoers.d/` grants `NOPASSWD` for exactly one program:
+   `/usr/local/bin/opencode-sudo-gate` (root-owned).
+3. The gate builds the dialog from **argv** (ground truth — the reason file
+   only contributes the decorative purpose, display hints and color
+   scheme), then:
+   - **Allow** → runs the command as root with a minimal environment
+   - **Deny / Esc / window close / 60s timeout / no display / any error** →
+     blocked (exit 1)
+
+Plain `sudo` that slips past the rewrite (e.g. inside quotes) can't
+authenticate in opencode's non-interactive shells, so it fails closed too.
 
 ## Requirements
 
-- Linux with `sudo`
-- Display server (Wayland or X11)
-- **Required:** GJS + GTK4 + libadwaita (native on GNOME) for the compact native dialog. Without `gjs` the popup cannot be shown.
+- Linux with `sudo` (tested with sudo-rs)
+- **OpenCode V2**
+- GJS + GTK4 + libadwaita (native on GNOME) for the dialog
+- `run0` (polkit) to install the root-owned files
+- A session display (Wayland or X11)
 
 ## Install
-
-Clone + install + restart opencode:
 
 ```bash
 git clone https://github.com/uvindusl/opencode-sudo-popup
 cd opencode-sudo-popup
-npm install
+npm install             # postinstall → plugin into ~/.config/opencode/plugins/
+npm run install-system  # ONE polkit prompt: root-owned gate + sudoers rule
 ```
 
-The `postinstall` script automatically:
+Restart opencode after installing so the plugin is loaded at startup.
 
-- Copies the askpass helper + GJS dialog to `~/.config/opencode/`.
-- Installs the plugin itself to `~/.config/opencode/plugin/sudo-reason.js`.
-- Adds `export SUDO_ASKPASS=...` to your shell rc file (`~/.zshenv`, `~/.bashrc`, or `~/.config/fish/config.fish` — only if not already set).
+`npm run install-system` stages both files, then asks polkit (via `run0`) to:
 
-> Restart opencode after installing so the plugin is loaded at startup.
+- install the gate → `/usr/local/bin/opencode-sudo-gate` (root:root, 755)
+- install the rule → `/etc/sudoers.d/opencode-sudo-gate` (root:root, 440)
+- validate the rule with `visudo -c -f`
+- prove it works with `sudo -n <gate> --selftest` (prints `ok`, no dialog)
 
-> Note: opencode may load your config shell with `sudo` (e.g. `sudo -A`). Ensure `SUDO_ASKPASS` is set in an environment that survives into the `sudo` process. `~/.zshenv` works for zsh. For bash, having it in `~/.bashrc` requires an interactive shell. In non-interactive/fish environments, consider an `alias sudo='sudo -A'` in that shell.
+## The dialog
 
-## Usage
+- Shows the exact command (rebuilt from argv), the working directory, and a
+  plain-language purpose ("Refreshing the system package list…",
+  "Installing the system package "nginx"…").
+- Follows your GNOME light/dark preference — the plugin captures it while
+  still running as you (root has no dconf of its own).
+- **Stray-input safe:** Enter is inert (no default response) and focus
+  starts on the command label, not a button. Any response arriving within
+  the first 750 ms is discarded and the dialog is re-shown — a keystroke
+  that lands while the window is appearing can never approve or deny.
+- Esc or Deny blocks; 60 seconds without an answer blocks.
 
-Just use opencode normally. Any time it needs root, the compact dialog appears showing the command to be run. Type your password to allow it once, or Cancel to deny.
+## Security model
 
-## Backend
+- `NOPASSWD` covers only the gate's absolute path — never `ALL`, never a
+  pattern. Any other sudo still requires real authentication, which
+  non-interactive opencode shells don't have → fails closed.
+- The gate is root-owned under `/usr/local/bin`: the agent (running as your
+  user) cannot edit the program that decides what runs as root.
+- The dialog runs *inside* the root-authorized program (pkexec model) —
+  clicking Allow **is** the authentication.
+- The displayed command comes from argv, never from the user-writable
+  reason file; reason-file content is allowlisted/validated before use.
+- The child runs with a fixed secure `PATH`, `HOME/USER/LOGNAME=/root`, and
+  an allowlist of locale variables only (`LANG`, `TERM`, `TZ`, …).
+- Fail-closed everywhere: deny, close, timeout, missing display, spawn
+  failure → blocked.
 
-The helper uses a native **GJS + GTK4 + libadwaita** dialog (`Adw.Window` with a `PasswordEntryRow` and monospace command label) — a tiny single-screen window. This is the only backend; it prints a clear error if `gjs` is unavailable.
+## Limitations
 
-The plugin writes JSON (`{command, purpose, ts}`) to the shared reason file; the GJS helper reads it with `Gio` (with fallback to old flat-string files).
-
-## What it catches
-
-It only matches `sudo` used as an actual command (whole word at a command boundary) — so it won't false-positive on a file path like `./some/sudo/file` or a `#`-comment mentioning sudo. It also strips sudo flags (`-u`, `-p`, etc.) and shell separators so the dialog shows the *real* command that needs root (e.g. `sudo apt update`).
+- Only `sudo` occurrences are rewritten; ones inside quotes or comments are
+  deliberately skipped (a miss fails closed — plain sudo can't
+  authenticate anyway).
+- sudo flags other than `-u`/`--user` are consumed and ignored (the gate
+  itself is the authentication); `-u user` is honored via `runuser`.
+- The purpose line is a best-effort offline heuristic; the command itself
+  is always exact.
+- If `gjs` is missing, the gate can't show a dialog — everything is
+  blocked rather than silently allowed.
 
 ## Development
 
 ```bash
-git clone https://github.com/uvindusl/opencode-sudo-popup
-cd opencode-sudo-popup
-npm install
-# postinstall wires the askpass helper into ~/.config/opencode.
-# To test the command-detection logic in isolation:
+# after editing src/index.js — reinstall the plugin (reloads on save):
+node scripts/install.js
+
+# after editing bin/opencode-sudo-gate:
+npm run install-system      # one polkit prompt
+
+# test the rewrite + reason file in isolation:
 node --input-type=module -e "
-import('./src/index.js').then(async m => {
-  const p = await m.default();
-  await p['tool.execute.before']({tool:'bash'}, {args:{command:'sudo apt update'}});
-});
-cat /tmp/opencode-sudo-reason
+const m = await import('./src/index.js');
+let hook;
+await m.default.setup({ tool: { hook: async (_n, cb) => { hook = cb; } } });
+const event = { tool: 'shell', input: { command: 'sudo apt update' } };
+await hook(event);
+console.log(event.input.command);   // rewritten through the gate
+console.log((await import('node:fs')).readFileSync('/tmp/opencode-sudo-reason', 'utf8'));
 "
 ```
 

@@ -1,0 +1,423 @@
+#!/usr/bin/gjs
+// opencode-sudo-gate — deterministic approval gate for privileged commands.
+//
+// Installed root-owned at /usr/local/bin/opencode-sudo-gate and listed in
+// /etc/sudoers.d/opencode-sudo-gate as the ONLY command the invoking user may
+// run as root without a password. The opencode plugin rewrites `sudo X` into
+// `sudo <gate> -- X`, so every privileged command opencode attempts flows
+// through this program, which shows a native Allow/Deny dialog and only then
+// executes the command as root.
+//
+// Contract:
+//   argv  = [--] <command tokens...>   (tokens already split by the invoking shell)
+//   exit  = child's exit status, or 1 when denied/unavailable (fail CLOSED)
+//
+// Security invariants:
+//   * Nothing executes before an explicit Allow click. Deny, window close,
+//     dialog timeout (60s), or any display failure all mean "blocked".
+//   * The command shown in the dialog is built from argv (ground truth),
+//     never from the user-writable reason file. The reason file only
+//     contributes the decorative "purpose" line and session display hints.
+//   * The child runs with a minimal environment and a fixed secure PATH so a
+//     user-controlled PATH or LD_* cannot redirect a root execution.
+//   * The shebang is absolute (/usr/bin/gjs) so PATH never selects the
+//     interpreter that runs as root.
+
+imports.gi.versions.Gtk = "4.0";
+imports.gi.versions.Adw = "1";
+const { Gtk, Adw, GLib, Gio } = imports.gi;
+
+const REASON_FILE = "/tmp/opencode-sudo-reason";
+const TIMEOUT_SECONDS = 60;
+const SECURE_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+const GENERIC_PURPOSE =
+  "opencode requested root to run the command below. Only approve if you expected a privileged step.";
+
+// sudo options that consume the following argument (mirrors the plugin).
+const FLAG_WITH_ARG = new Set(["-C", "-D", "-h", "-p", "-u", "-U", "-g", "-T"]);
+
+let denyReason = ""; // why the dialog ended without Allow (for the error line)
+
+// ---------------------------------------------------------------------------
+// Reason file (decorative context only)
+// ---------------------------------------------------------------------------
+
+function readReason() {
+  try {
+    const file = Gio.File.new_for_path(REASON_FILE);
+    if (!file.query_exists(null)) return {};
+    const [, bytes] = file.load_contents(null);
+    const raw = new TextDecoder().decode(bytes).trim();
+    if (!raw.startsWith("{")) return {}; // legacy flat-string era — ignore
+    const data = JSON.parse(raw);
+    return data && typeof data === "object" ? data : {};
+  } catch {
+    return {};
+  }
+}
+
+// Session display hints captured by the plugin. Everything read from the
+// user-writable reason file is strictly validated — it may only select WHERE
+// the popup appears, never WHAT runs.
+function sessionEnv(reason) {
+  const src = reason.env && typeof reason.env === "object" ? reason.env : {};
+  const env = {};
+
+  const wd = String(src.WAYLAND_DISPLAY || "wayland-0");
+  if (/^[A-Za-z0-9_.:-]{1,64}$/.test(wd)) env.WAYLAND_DISPLAY = wd;
+
+  const disp = String(src.DISPLAY || ":0");
+  if (/^[A-Za-z0-9_.:/-]{1,64}$/.test(disp)) env.DISPLAY = disp;
+
+  const rt = String(src.XDG_RUNTIME_DIR || "");
+  const sudoUid = GLib.getenv("SUDO_UID") || "";
+  const fallback = /^\d+$/.test(sudoUid) ? `/run/user/${sudoUid}` : "";
+  const runtime = /^\/run\/user\/\d+$/.test(rt) ? rt : fallback;
+  if (runtime) env.XDG_RUNTIME_DIR = runtime;
+
+  return env;
+}
+
+// Root has no X11 authority of its own; mutter's Xwayland cookie lets the
+// fallback path connect to the X server if the direct Wayland path fails.
+function findXauthority(runtimeDir) {
+  if (!runtimeDir) return "";
+  try {
+    const dir = Gio.File.new_for_path(runtimeDir);
+    const enumerator = dir.enumerate_children("standard::name", Gio.FileQueryInfoFlags.NONE, null);
+    let info;
+    while ((info = enumerator.next_file(null))) {
+      const name = info.get_name();
+      if (name.startsWith(".mutter-Xwaylandauth")) return `${runtimeDir}/${name}`;
+    }
+  } catch {
+    // fall through
+  }
+  return "";
+}
+
+// ---------------------------------------------------------------------------
+// Dialog — returns { allowed, why }
+// ---------------------------------------------------------------------------
+
+function askAllow(displayCmd, purpose, cwd, displayHints, colorScheme) {
+  const attempt = (hints) => {
+    for (const key of Object.keys(hints)) GLib.setenv(key, hints[key], true);
+    try {
+      return Gtk.init_check();
+    } catch {
+      return false;
+    }
+  };
+
+  // Prefer the session's Wayland display; fall back to Xwayland with the
+  // session's authority cookie if a direct Wayland connection fails.
+  let ok = attempt(displayHints);
+  if (!ok) {
+    GLib.unsetenv("WAYLAND_DISPLAY");
+    const xHints = { DISPLAY: displayHints.DISPLAY || ":0" };
+    const xa = findXauthority(displayHints.XDG_RUNTIME_DIR);
+    if (xa) xHints.XAUTHORITY = xa;
+    ok = attempt(xHints);
+  }
+  if (!ok) return { allowed: false, why: "no graphical display available" };
+
+  Adw.init();
+
+  // Match the user's GNOME preference. The plugin captured it while running
+  // as the user (root has no dconf of its own, so libadwaita would default
+  // to light). Values are allowlisted on both sides — decorative only.
+  const SCHEMES = {
+    default: Adw.ColorScheme.DEFAULT,
+    "prefer-light": Adw.ColorScheme.PREFER_LIGHT,
+    "force-light": Adw.ColorScheme.FORCE_LIGHT,
+    "prefer-dark": Adw.ColorScheme.PREFER_DARK,
+    "force-dark": Adw.ColorScheme.FORCE_DARK,
+  };
+  if (SCHEMES[colorScheme]) {
+    try {
+      Adw.StyleManager.get_default().set_color_scheme(SCHEMES[colorScheme]);
+    } catch {
+      // Cosmetic — never fail the gate over theming.
+    }
+  }
+
+  // Canonical libadwaita approval dialog: rounded corners, dimmed backdrop,
+  // suggested response styling, Esc = close-response = deny.
+  //
+  // Stray-input safety: any response arriving within GRACE_MS of present()
+  // is DISCARDED and a fresh dialog is shown — a keystroke that lands while
+  // the window is still appearing (mid-typing Enter/Esc) must never be
+  // honored as a verdict. Keyboard focus is parked on the command label and
+  // no default response is set, so Enter alone is inert after the grace.
+  const GRACE_MS = 750;
+  let verdict = { allowed: false, why: "dialog closed" };
+  const loop = new GLib.MainLoop(null, false);
+  let currentDlg = null;
+  let rebuildId = 0;
+  let timedOut = false;
+
+  const presentAttempt = () => {
+    rebuildId = 0;
+    if (timedOut) return;
+    const shownAt = GLib.get_monotonic_time();
+
+    const dlg = new Adw.AlertDialog({
+      heading: "opencode wants root",
+      body: purpose,
+    });
+
+    // Ground truth: exactly what will be executed, straight from argv.
+    const extra = new Gtk.Box({
+      orientation: Gtk.Orientation.VERTICAL,
+      spacing: 6,
+      margin_top: 8,
+    });
+    const cmdLbl = new Gtk.Label({
+      label: displayCmd,
+      wrap: true,
+      xalign: 0,
+      selectable: true,
+      max_width_chars: 52,
+    });
+    cmdLbl.add_css_class("monospace");
+    extra.append(cmdLbl);
+    if (cwd) {
+      const cwdLbl = new Gtk.Label({
+        label: `in ${cwd.length > 72 ? "…" + cwd.slice(-71) : cwd}`,
+        wrap: true,
+        xalign: 0,
+      });
+      cwdLbl.add_css_class("dim-label");
+      cwdLbl.add_css_class("caption");
+      extra.append(cwdLbl);
+    }
+    dlg.set_extra_child(extra);
+
+    dlg.add_response("deny", "Deny");
+    dlg.add_response("allow", "Allow");
+    dlg.set_response_appearance("allow", Adw.ResponseAppearance.SUGGESTED);
+    dlg.set_close_response("deny"); // Esc denies; Enter is inert (no default)
+
+    dlg.connect("response", (_d, id) => {
+      if (GLib.get_monotonic_time() - shownAt < GRACE_MS * 1000) {
+        // Input arrived while the dialog was appearing: discard it and
+        // re-show. Covers both accidental Deny (typing Enter/Esc) and
+        // accidental Allow (stray click) — the user answers the NEXT one.
+        if (!rebuildId && !timedOut) {
+          rebuildId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 250, () => {
+            rebuildId = 0;
+            presentAttempt();
+            return GLib.SOURCE_REMOVE;
+          });
+        }
+        return;
+      }
+      verdict =
+        id === "allow" ? { allowed: true, why: "" } : { allowed: false, why: "user denied" };
+      loop.quit();
+    });
+
+    currentDlg = dlg;
+    dlg.present(null);
+    // Park focus on the command label so a stray Enter can't activate a
+    // button; Tab still reaches the buttons for keyboard users.
+    GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
+      if (currentDlg === dlg) dlg.set_focus(cmdLbl);
+      return GLib.SOURCE_REMOVE;
+    });
+  };
+
+  // Fail closed if nobody answers — ONE deadline from the first present,
+  // spanning grace re-shows.
+  const timeoutId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, TIMEOUT_SECONDS, () => {
+    timedOut = true;
+    verdict = { allowed: false, why: `timed out after ${TIMEOUT_SECONDS}s` };
+    if (rebuildId) {
+      GLib.source_remove(rebuildId);
+      rebuildId = 0;
+    }
+    if (currentDlg) {
+      try {
+        currentDlg.force_close();
+      } catch {
+        // already gone
+      }
+    }
+    loop.quit();
+    return GLib.SOURCE_REMOVE;
+  });
+
+  presentAttempt();
+  loop.run();
+  if (timeoutId && !timedOut) GLib.source_remove(timeoutId);
+  return verdict;
+}
+
+// ---------------------------------------------------------------------------
+// Command construction
+// ---------------------------------------------------------------------------
+
+// Round-trip an argv token back into shell source so `sh -c` reproduces the
+// original argument exactly (quotes, spaces, metacharacters and all).
+function shellQuote(s) {
+  if (/^[A-Za-z0-9_@%+=:,./-]+$/.test(s)) return s;
+  return `'${String(s).replace(/'/g, `'\\''`)}'`;
+}
+
+// Strip leading sudo options from the token list. Honors -u/--user (via
+// runuser); other options are consumed and ignored — the gate itself is the
+// authentication, so sudo's own auth/prompt flags are meaningless here.
+function stripSudoFlags(argv) {
+  let i = 0;
+  let runAs = "";
+  while (i < argv.length) {
+    const t = argv[i];
+    if (t === "--") {
+      i++;
+      break;
+    }
+    if (t.startsWith("-") && t.length > 1) {
+      if (t === "-u" || t === "--user") {
+        runAs = argv[i + 1] || "";
+        i += 2;
+        continue;
+      }
+      if (t.startsWith("--user=")) {
+        runAs = t.slice(7);
+        i++;
+        continue;
+      }
+      if (t.startsWith("-u") && t.length > 2) {
+        runAs = t.slice(2);
+        i++;
+        continue;
+      }
+      if (FLAG_WITH_ARG.has(t)) {
+        i += 2;
+        continue;
+      }
+      i++; // bare flag (clusters like -EH handled as-is; behavior: ignored)
+      continue;
+    }
+    break;
+  }
+  const rest = argv.slice(i).map(shellQuote).join(" ");
+  return { rest, runAs };
+}
+
+// Minimal, fixed environment for the root child. Only these variables are
+// ever passed through; everything else (PATH, LD_*, HOME, …) is set here.
+function childEnv() {
+  const envp = [
+    `PATH=${SECURE_PATH}`,
+    "HOME=/root",
+    "USER=root",
+    "LOGNAME=root",
+    "SHELL=/bin/sh",
+  ];
+  for (const key of ["LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE", "TERM", "TZ"]) {
+    const v = GLib.getenv(key);
+    if (v && !/[=\n]/.test(v)) envp.push(`${key}=${v}`);
+  }
+  return envp;
+}
+
+function waitStatusToExit(status) {
+  const sig = status & 0x7f;
+  if (sig !== 0) return 128 + sig;
+  return (status >> 8) & 0xff;
+}
+
+// Spawn the approved command with inherited stdio, wait for it, and return
+// its exit status. Output streams live while the command runs.
+function runChild(parsed) {
+  let argv;
+  if (parsed.runAs) {
+    if (!/^[a-z_][a-z0-9_-]{0,31}$/.test(parsed.runAs)) {
+      printerr(`opencode-sudo-gate: blocked: invalid -u user "${parsed.runAs}"`);
+      return 1;
+    }
+    const runuser = ["/usr/bin/runuser", "/usr/sbin/runuser"].find((p) =>
+      GLib.file_test(p, GLib.FileTest.IS_EXECUTABLE),
+    );
+    if (!runuser) {
+      printerr("opencode-sudo-gate: blocked: runuser not available for -u");
+      return 1;
+    }
+    argv = [runuser, "-u", parsed.runAs, "--", "/bin/sh", "-c", parsed.rest];
+  } else {
+    argv = ["/bin/sh", "-c", parsed.rest];
+  }
+
+  let pid;
+  try {
+    const [, spawned] = GLib.spawn_async(null, argv, childEnv(), GLib.SpawnFlags.DO_NOT_REAP_CHILD, null);
+    pid = spawned;
+  } catch (e) {
+    printerr(`opencode-sudo-gate: failed to start command: ${e.message}`);
+    return 127;
+  }
+
+  let exitCode = 1;
+  const loop = new GLib.MainLoop(null, false);
+  GLib.child_watch_add(GLib.PRIORITY_DEFAULT, pid, (childPid, status) => {
+    exitCode = waitStatusToExit(status);
+    GLib.spawn_close_pid(childPid);
+    loop.quit();
+  });
+  loop.run();
+  return exitCode;
+}
+
+// ---------------------------------------------------------------------------
+// Entry
+// ---------------------------------------------------------------------------
+
+function main() {
+  const args = [...ARGV];
+  if (args[0] === "--selftest") {
+    // Non-interactive probe used by scripts/install-system.js to prove the
+    // sudoers rule works. Shows no dialog, executes nothing.
+    print("ok");
+    return 0;
+  }
+  if (args[0] === "--") args.shift();
+  if (!args.length) {
+    printerr("opencode-sudo-gate: no command given");
+    return 1;
+  }
+
+  const reason = readReason();
+  const parsed = stripSudoFlags(args);
+  if (!parsed.rest) {
+    printerr("opencode-sudo-gate: blocked: empty command after sudo options");
+    return 1;
+  }
+
+  const displayCmd = `sudo ${parsed.rest}`;
+  const purpose =
+    typeof reason.purpose === "string" && reason.purpose.trim()
+      ? reason.purpose.trim().slice(0, 300)
+      : GENERIC_PURPOSE;
+  const cwd = GLib.get_current_dir();
+
+  // Color scheme comes from the user-writable reason file — allowlist it
+  // again here; anything unrecognized means "let libadwaita decide".
+  const rawScheme =
+    reason.env && typeof reason.env.COLOR_SCHEME === "string" ? reason.env.COLOR_SCHEME : "";
+  const colorScheme = /^(default|prefer-light|prefer-dark|force-light|force-dark)$/.test(rawScheme)
+    ? rawScheme
+    : "";
+
+  const verdict = askAllow(displayCmd, purpose, cwd, sessionEnv(reason), colorScheme);
+  if (!verdict.allowed) {
+    printerr(`opencode-sudo-gate: BLOCKED ${displayCmd} (${verdict.why})`);
+    return 1;
+  }
+
+  return runChild(parsed);
+}
+
+const code = main();
+imports.system.exit(code);

@@ -1,4 +1,5 @@
 import { writeFile, mkdir } from "node:fs/promises"
+import { execFile } from "node:child_process"
 
 // Where the askpass helper (installed by the postinstall script) lives.
 // SUDO_ASKPASS points here; this plugin only needs to know the shared
@@ -185,31 +186,152 @@ function inferPurpose(target, fullCmd = "") {
   return "Opencode requested root to run the command below. Only approve if you expected a privileged step."
 }
 
+// GNOME color scheme, read while still running as the user (the gate runs as
+// root, whose dconf is empty — so root GTK would otherwise always show a light
+// dialog). Allowlisted; the gate validates again before applying it.
+const COLOR_SCHEMES = new Set([
+  "default",
+  "prefer-light",
+  "prefer-dark",
+  "force-light",
+  "force-dark",
+])
+
+function detectColorScheme() {
+  return new Promise((resolve) => {
+    execFile(
+      "gsettings",
+      ["get", "org.gnome.desktop.interface", "color-scheme"],
+      { timeout: 1000 },
+      (err, stdout) => {
+        if (err) return resolve("")
+        const v = String(stdout).trim().replace(/^['"]|['"]$/g, "")
+        resolve(COLOR_SCHEMES.has(v) ? v : "")
+      },
+    )
+  })
+}
+
 async function writeReason(cmd) {
   try {
     await mkdir("/tmp", { recursive: true })
     const target = sudoTarget(cmd).replace(/\s+/g, " ").trim().slice(0, 800)
     const purpose = inferPurpose(target, cmd)
+    // Session display hints so the gate (running as root under sudo) knows
+    // which of the user's screens to show the popup on. Validated again on
+    // the gate side; decorative only — never used to decide what runs.
+    const env = {}
+    for (const key of ["WAYLAND_DISPLAY", "DISPLAY", "XDG_RUNTIME_DIR", "XDG_SESSION_TYPE"]) {
+      const v = process.env[key]
+      if (v && typeof v === "string" && v.length <= 128) env[key] = v
+    }
+    const colorScheme = await detectColorScheme()
+    if (colorScheme) env.COLOR_SCHEME = colorScheme
     await writeFile(
       REASON_FILE,
-      JSON.stringify({ v: 1, command: target, purpose, ts: Math.floor(Date.now() / 1000) }),
+      JSON.stringify({ v: 2, command: target, purpose, ts: Math.floor(Date.now() / 1000), env }),
     )
   } catch {
     // Best effort — the popup still works with a generic title.
   }
 }
 
-// Never treat our own plumbing as a sudo request: commands that reference
-// the reason file or the askpass helper (self-tests, setup, diagnostics)
-// must not overwrite the very reason they are trying to inspect.
-const SELF_RE = /opencode-sudo-reason|sudo-askpass/i
+// Commands that reference the reason file are probes/self-tests: never let
+// them overwrite the very reason they are trying to inspect.
+const REASON_RE = /opencode-sudo-reason/
 
-export default async () => ({
-  "tool.execute.before": async (input, output) => {
-    if (input.tool !== "bash") return
-    const cmd = String(output.args?.command ?? "")
-    if (SELF_RE.test(cmd)) return
-    if (!containsSudo(cmd)) return
-    await writeReason(cmd)
+// The installed gate — the ONLY program sudo will run without a password.
+// Every real `sudo` occurrence in a shell command is rewritten into an
+// invocation of this gate, which pops up Allow/Deny before executing.
+const GATE_PATH = "/usr/local/bin/opencode-sudo-gate"
+
+// Quote-aware scan for real `sudo` command occurrences. Returns the start
+// index of each `sudo` word that sits at a command boundary (start of line,
+// or after ; & | ( or whitespace) OUTSIDE of quotes and comments, and is
+// followed by whitespace + at least one argument. Text inside quotes or
+// after a comment marker is data, not a command, and is never rewritten —
+// a missed match fails closed (plain sudo can't authenticate without a TTY).
+function findSudo(cmd) {
+  const hits = []
+  let i = 0
+  let quote = null
+  const boundary = (ch) => ch === undefined || /[;&|(\s]/.test(ch)
+  while (i < cmd.length) {
+    const ch = cmd[i]
+    if (quote) {
+      if (ch === "\\") {
+        if (quote !== "'") i++ // backslash escapes inside " and `, literal inside '
+      } else if (ch === quote) {
+        quote = null
+      }
+      i++
+      continue
+    }
+    if (ch === "\\") {
+      i += 2
+      continue
+    }
+    if (ch === "'" || ch === '"' || ch === "`") {
+      quote = ch
+      i++
+      continue
+    }
+    if (ch === "#" && (i === 0 || /[\s;&|]/.test(cmd[i - 1]))) {
+      while (i < cmd.length && cmd[i] !== "\n") i++
+      continue
+    }
+    if (
+      cmd.startsWith("sudo", i) &&
+      boundary(i === 0 ? undefined : cmd[i - 1]) &&
+      i + 4 < cmd.length &&
+      /[\s]/.test(cmd[i + 4])
+    ) {
+      // skip whitespace; must be followed by an argument
+      let j = i + 4
+      while (j < cmd.length && /\s/.test(cmd[j])) j++
+      if (j < cmd.length && !/\s/.test(cmd[j])) hits.push(i)
+      i += 4
+      continue
+    }
+    i++
+  }
+  return hits
+}
+
+// Rewrite eligible `sudo` words to route through the gate:
+//   `sudo apt update` → `sudo /usr/local/bin/opencode-sudo-gate -- apt update`
+// Occurrences already followed by the gate path are left alone (idempotent).
+function routeThroughGate(cmd) {
+  const eligible = findSudo(cmd).filter((s) => {
+    let j = s + 4
+    while (j < cmd.length && /\s/.test(cmd[j])) j++
+    return !cmd.startsWith(GATE_PATH, j)
+  })
+  if (!eligible.length) return null
+  let out = cmd
+  for (const s of eligible.reverse()) {
+    out = out.slice(0, s + 4) + ` ${GATE_PATH} --` + out.slice(s + 4)
+  }
+  return out
+}
+
+// V2 plugin definition: `{ id, setup }`. This deliberately does NOT import
+// `Plugin` from `@opencode/plugin` — that package is only an identity helper
+// (`define` just returns its argument), and this file is installed as a bare
+// global file at ~/.config/opencode/plugins/, where no node_modules exists to
+// resolve an import from. The plain object shape is exactly what the loader
+// expects.
+export default {
+  id: "opencode-sudo-popup",
+  async setup(ctx) {
+    await ctx.tool.hook("execute.before", async (event) => {
+      if (event.tool !== "shell") return
+      const cmd = String(event.input?.command ?? "")
+      if (REASON_RE.test(cmd)) return
+      if (!findSudo(cmd).length) return
+      await writeReason(cmd)
+      const rewritten = routeThroughGate(cmd)
+      if (rewritten !== null) event.input.command = rewritten
+    })
   },
-})
+}

@@ -1,7 +1,7 @@
 {
   "name": "opencode-sudo-popup",
-  "version": "1.0.0",
-  "description": "Shows a desktop GUI popup when opencode needs sudo, so you know exactly what command requires root before typing your password.",
+  "version": "2.0.0",
+  "description": "Deterministic sudo approval gate for opencode: every privileged command pops up an Adwaita dialog to Allow or Deny before it runs as root.",
   "author": "Uvindu Sankalpa",
   "license": "MIT",
   "type": "module",
@@ -22,20 +22,19 @@
   },
   "homepage": "https://github.com/uvindusl/opencode-sudo-popup#readme",
   "scripts": {
-    "postinstall": "node scripts/install.js"
+    "postinstall": "node scripts/install.js",
+    "install-system": "node scripts/install-system.js"
   },
   "keywords": [
     "opencode",
     "plugin",
     "sudo",
+    "gate",
     "popup",
     "prompt",
-    "zenity",
     "gui",
-    "askpass",
+    "adwaita",
+    "approval",
     "permission"
-  ],
-  "dependencies": {
-    "@opencode-ai/plugin": "^1.17.0"
-  }
+  ]
 }
