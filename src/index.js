@@ -204,12 +204,44 @@ async function writeReason(cmd) {
 // must not overwrite the very reason they are trying to inspect.
 const SELF_RE = /opencode-sudo-reason|sudo-askpass/i
 
-export default async () => ({
-  "tool.execute.before": async (input, output) => {
-    if (input.tool !== "bash") return
-    const cmd = String(output.args?.command ?? "")
-    if (SELF_RE.test(cmd)) return
-    if (!containsSudo(cmd)) return
-    await writeReason(cmd)
+async function handleCommand(command) {
+  const cmd = String(command ?? "")
+  if (SELF_RE.test(cmd)) return
+  if (!containsSudo(cmd)) return
+  await writeReason(cmd)
+}
+
+// V2 is optional at load time: an OpenCode V2 host provides `@opencode/plugin`
+// while legacy V1 provides `@opencode-ai/plugin`. Resolve lazily and fall back
+// to an identity `define` so the same file also loads under V1.
+let Plugin
+try {
+  ;({ Plugin } = await import("@opencode/plugin"))
+} catch {
+  Plugin = { define: (plugin) => plugin }
+}
+
+export default {
+  // OpenCode V2: `setup` registers a tool hook on the V2 ctx domain API.
+  ...Plugin.define({
+    id: "opencode-sudo-popup",
+    async setup(ctx) {
+      const registration = await ctx.tool.hook("execute.before", async (event) => {
+        if (event.tool !== "bash") return
+        const input = event.input
+        const command = input && typeof input === "object" ? input.command : undefined
+        await handleCommand(command)
+      })
+      return () => registration.dispose()
+    },
+  }),
+  // OpenCode V1 (legacy): V1 calls `server()` and uses the returned hooks.
+  async server() {
+    return {
+      "tool.execute.before": async (input, output) => {
+        if (input.tool !== "bash") return
+        await handleCommand(output.args?.command)
+      },
+    }
   },
-})
+}

@@ -23,10 +23,12 @@ npm install
 The `postinstall` script automatically:
 
 - Copies the askpass helper + GJS dialog to `~/.config/opencode/`.
-- Installs the plugin itself to `~/.config/opencode/plugin/sudo-reason.js`.
+- Installs the plugin itself to `~/.config/opencode/plugin/sudo-reason.js` (OpenCode V1) and `~/.config/opencode/plugins/sudo-reason.js` (OpenCode V2).
 - Adds `export SUDO_ASKPASS=...` to your shell rc file (`~/.zshenv`, `~/.bashrc`, or `~/.config/fish/config.fish` — only if not already set).
 
 > Restart opencode after installing so the plugin is loaded at startup.
+
+> V2 note: the plugin is built for the OpenCode V2 plugin API (`@opencode/plugin`, `Plugin.define`) and keeps a V1 `server()` export for legacy hosts. Because `postinstall` drops it straight into the discovered plugin directory, no `plugins` entry is needed in `opencode.json`. To load it as a package instead, add `"plugins": ["opencode-sudo-popup"]`.
 
 > Note: opencode may load your config shell with `sudo` (e.g. `sudo -A`). Ensure `SUDO_ASKPASS` is set in an environment that survives into the `sudo` process. `~/.zshenv` works for zsh. For bash, having it in `~/.bashrc` requires an interactive shell. In non-interactive/fish environments, consider an `alias sudo='sudo -A'` in that shell.
 
@@ -51,11 +53,15 @@ git clone https://github.com/uvindusl/opencode-sudo-popup
 cd opencode-sudo-popup
 npm install
 # postinstall wires the askpass helper into ~/.config/opencode.
-# To test the command-detection logic in isolation:
+# To test the command-detection logic in isolation (V2 + V1 hooks):
 node --input-type=module -e "
-import('./src/index.js').then(async m => {
-  const p = await m.default();
-  await p['tool.execute.before']({tool:'bash'}, {args:{command:'sudo apt update'}});
+import('./src/index.js').then(async (m) => {
+  const p = m.default;
+  // OpenCode V2 hook
+  await p.setup({ tool: { hook: async (name, cb) => { await cb({ tool: 'bash', input: { command: 'sudo apt update' } }); return { dispose() {} } } } });
+  // OpenCode V1 hook
+  const hooks = await p.server();
+  await hooks['tool.execute.before']({ tool: 'bash' }, { args: { command: 'sudo apt update' } });
 });
 cat /tmp/opencode-sudo-reason
 "

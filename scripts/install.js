@@ -9,8 +9,8 @@ const HOME = homedir()
 const CONFIG_DIR = join(HOME, ".config", "opencode")
 const ASKPASS_DEST = join(CONFIG_DIR, "sudo-askpass.sh")
 const GJS_DEST = join(CONFIG_DIR, "sudo-askpass-gjs.js")
-const PLUGIN_DIR = join(CONFIG_DIR, "plugin")
-const PLUGIN_DEST = join(PLUGIN_DIR, "sudo-reason.js")
+// OpenCode V1 discovers global plugins in `plugin/`, V2 uses `plugins/`.
+const PLUGIN_DIRS = [join(CONFIG_DIR, "plugin"), join(CONFIG_DIR, "plugins")]
 
 const ASKPASS_UNIX = `"${ASKPASS_DEST}"`
 const ASKPASS_ESC = ASKPASS_UNIX.replaceAll('"', '\\"')
@@ -30,11 +30,16 @@ async function ensureAskpass() {
 }
 
 async function ensurePlugin() {
-  await mkdir(PLUGIN_DIR, { recursive: true })
   const src = join(__dirname, "..", "src", "index.js")
   const content = await readFile(src)
-  await writeFile(PLUGIN_DEST, content)
-  return PLUGIN_DEST
+  const dests = []
+  for (const dir of PLUGIN_DIRS) {
+    await mkdir(dir, { recursive: true })
+    const dest = join(dir, "sudo-reason.js")
+    await writeFile(dest, content)
+    dests.push(dest)
+  }
+  return dests
 }
 
 function shellRc(shell) {
@@ -72,8 +77,8 @@ async function ensureEnv() {
 async function main() {
   const ask = await ensureAskpass()
   console.log(`[opencode-sudo-popup] askpass helper -> ${ask}`)
-  const plugin = await ensurePlugin()
-  console.log(`[opencode-sudo-popup] plugin -> ${plugin}`)
+  const plugins = await ensurePlugin()
+  for (const plugin of plugins) console.log(`[opencode-sudo-popup] plugin -> ${plugin}`)
   const wired = await ensureEnv()
   if (wired) console.log("[opencode-sudo-popup] SUDO_ASKPASS exported to your shell rc")
 }
