@@ -212,7 +212,52 @@ function detectColorScheme() {
   })
 }
 
-async function writeReason(cmd) {
+// Ubuntu's libadwaita derives its Yaru accent from accent-color (root
+// defaults to orange, hence the orange above). Capture the user's value;
+// the gate writes it into root's own dconf before Adw initializes.
+const ACCENT_COLORS = new Set([
+  "blue",
+  "teal",
+  "green",
+  "yellow",
+  "orange",
+  "red",
+  "pink",
+  "purple",
+  "slate",
+])
+
+function detectAccentColor() {
+  return new Promise((resolve) => {
+    execFile(
+      "gsettings",
+      ["get", "org.gnome.desktop.interface", "accent-color"],
+      { timeout: 1000 },
+      (err, stdout) => {
+        if (err) return resolve("")
+        const v = String(stdout).trim().replace(/^['"]|['"]$/g, "")
+        resolve(ACCENT_COLORS.has(v) ? v : "")
+      },
+    )
+  })
+}
+
+function detectGtkTheme() {
+  return new Promise((resolve) => {
+    execFile(
+      "gsettings",
+      ["get", "org.gnome.desktop.interface", "gtk-theme"],
+      { timeout: 1000 },
+      (err, stdout) => {
+        if (err) return resolve("")
+        const v = String(stdout).trim().replace(/^['"]|['"]$/g, "")
+        resolve(/^[A-Za-z0-9_-]{1,64}$/.test(v) ? v : "")
+      },
+    )
+  })
+}
+
+async function writeReason(cmd, batch = [], sessionID = "") {
   try {
     await mkdir("/tmp", { recursive: true })
     const target = sudoTarget(cmd).replace(/\s+/g, " ").trim().slice(0, 800)
@@ -227,9 +272,24 @@ async function writeReason(cmd) {
     }
     const colorScheme = await detectColorScheme()
     if (colorScheme) env.COLOR_SCHEME = colorScheme
+    // Desktop GTK theme name (e.g. Yaru-blue-dark). Ubuntu's libadwaita
+    // derives its Yaru accent + styling from this; the gate applies it via
+    // Gtk.Settings (same path every desktop app uses). NOTE: never via the
+    // GTK_THEME env var — that bypasses libadwaita and renders unstyled.
+    const gtkTheme = await detectGtkTheme()
+    if (gtkTheme) env.GTK_THEME = gtkTheme
+    const accentColor = await detectAccentColor()
+    if (accentColor) env.ACCENT_COLOR = accentColor
+    // Session key: "Allow for this session" is scoped to this OpenCode
+    // session. HOME lets the gate discover the user's opencode.json(c)
+    // files (the gate runs as root, whose HOME is /root). Both allowlisted.
+    if (typeof sessionID === "string" && /^[A-Za-z0-9_-]{1,64}$/.test(sessionID))
+      env.SESSION_KEY = sessionID
+    const home = process.env.HOME
+    if (typeof home === "string" && /^\/home\/[A-Za-z0-9._-]{1,64}$/.test(home)) env.HOME = home
     await writeFile(
       REASON_FILE,
-      JSON.stringify({ v: 2, command: target, purpose, ts: Math.floor(Date.now() / 1000), env }),
+      JSON.stringify({ v: 3, command: target, purpose, ts: Math.floor(Date.now() / 1000), env, batch }),
     )
   } catch {
     // Best effort — the popup still works with a generic title.
@@ -298,9 +358,35 @@ function findSudo(cmd) {
   return hits
 }
 
+// 12 hex chars, one per sudo occurrence. The gate learns its own xid from
+// argv and its siblings from the reason file's batch list, so one shared
+// window can cover every sudo in the line (and later arrivals can claim
+// their pre-seeded row).
+function makeXid() {
+  const bytes = new Uint8Array(6)
+  globalThis.crypto.getRandomValues(bytes)
+  return [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("")
+}
+
+// The shell segment ([;&|]-delimited chunk) containing this sudo hit —
+// used to build per-occurrence display text for the batch list. Cheap and
+// display-only: the gate always shows its own argv as ground truth.
+function segmentContaining(cmd, hit) {
+  let start = 0
+  for (let i = 0; i < cmd.length; i++) {
+    if (/[;&|]/.test(cmd[i])) {
+      if (hit >= start && hit < i) return cmd.slice(start, i)
+      start = i + 1
+    }
+  }
+  return cmd.slice(start)
+}
+
 // Rewrite eligible `sudo` words to route through the gate:
-//   `sudo apt update` → `sudo /usr/local/bin/opencode-sudo-gate -- apt update`
+//   `sudo apt update` → `sudo /usr/local/bin/opencode-sudo-gate --xid=<hex> -- apt update`
 // Occurrences already followed by the gate path are left alone (idempotent).
+// Returns { out, batch } — batch lists every occurrence's xid + display text
+// so the reason file can pre-seed sibling rows in the shared queue window.
 function routeThroughGate(cmd) {
   const eligible = findSudo(cmd).filter((s) => {
     let j = s + 4
@@ -308,11 +394,19 @@ function routeThroughGate(cmd) {
     return !cmd.startsWith(GATE_PATH, j)
   })
   if (!eligible.length) return null
-  let out = cmd
-  for (const s of eligible.reverse()) {
-    out = out.slice(0, s + 4) + ` ${GATE_PATH} --` + out.slice(s + 4)
+  let out = ""
+  let prev = 0
+  const batch = []
+  for (const s of eligible) {
+    const xid = makeXid()
+    out += cmd.slice(prev, s + 4) + ` ${GATE_PATH} --xid=${xid} --`
+    prev = s + 4
+    const seg = segmentContaining(cmd, s)
+    const text = sudoTarget(seg).replace(/\s+/g, " ").trim().slice(0, 800)
+    batch.push({ xid, command: text, purpose: inferPurpose(text, seg).slice(0, 300) })
   }
-  return out
+  out += cmd.slice(prev)
+  return { out, batch }
 }
 
 // V2 plugin definition: `{ id, setup }`. This deliberately does NOT import
@@ -329,9 +423,18 @@ export default {
       const cmd = String(event.input?.command ?? "")
       if (REASON_RE.test(cmd)) return
       if (!findSudo(cmd).length) return
-      await writeReason(cmd)
-      const rewritten = routeThroughGate(cmd)
-      if (rewritten !== null) event.input.command = rewritten
+      const routed = routeThroughGate(cmd)
+      if (routed === null) return
+      await writeReason(cmd, routed.batch, event.sessionID ?? "")
+      event.input.command = routed.out
+    })
+    // The approval window has no inactivity timeout (deciding is up to the
+    // user), so give sudo commands a long shell timeout — otherwise the tool
+    // call could be killed while the user is still reading the dialog.
+    await ctx.shell.hook("create.before", (event) => {
+      if (REASON_RE.test(event.command)) return
+      if (!findSudo(event.command).length) return
+      if (event.timeout > 0) event.timeout = Math.max(event.timeout, 1_800_000)
     })
   },
 }

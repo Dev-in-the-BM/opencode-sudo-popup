@@ -3,40 +3,69 @@
 //
 // Installed root-owned at /usr/local/bin/opencode-sudo-gate and listed in
 // /etc/sudoers.d/opencode-sudo-gate as the ONLY command the invoking user may
-// run as root without a password. The opencode plugin rewrites `sudo X` into
-// `sudo <gate> -- X`, so every privileged command opencode attempts flows
-// through this program, which shows a native Allow/Deny dialog and only then
-// executes the command as root.
+// run as root without a password. The opencode plugin rewrites each `sudo X`
+// into `sudo <gate> --xid=<hex> -- X`, so every privileged command opencode
+// attempts flows through this program.
 //
-// Contract:
-//   argv  = [--] <command tokens...>   (tokens already split by the invoking shell)
-//   exit  = child's exit status, or 1 when denied/unavailable (fail CLOSED)
+// Flow of one gate invocation (waiter):
+//   1. Build the display command from argv (ground truth).
+//   2. Evaluate persistent rules first (fast path): deny → block, allow →
+//      run immediately, no dialog.
+//   3. Otherwise enqueue itself (plus batch siblings from the reason file)
+//      into the shared queue and make sure one detached presenter window is
+//      running; wait (no timeout) until the user decides.
+//   4. Allow → execute as root with a minimal environment; Deny → exit 1.
+//
+// The presenter (spawned detached via setsid) owns the Adwaita window: it
+// shows ALL pending sudo requests, the user checks any subset and applies
+// one of five options — Deny / Deny always / Allow once / Allow this
+// session / Allow always. The window stays open until every row is decided
+// (auto-closes shortly after) or the user closes it (remaining rows are
+// denied). There is deliberately no inactivity timeout.
+//
+// Rule sources (deny wins over allow; opencode.json `allow` is IGNORED
+// because that file is writable by the agent being gated):
+//   1. opencode.json(c) permissions — deny/ask only, global → project,
+//      .opencode last (OpenCode merge order). Unparsable ⇒ ask.
+//   2. /etc/opencode-sudo-gate/rules.json — root-owned always-rules.
+//   3. /run/opencode-sudo-gate/session/<sessionID>.json — this-session rules.
 //
 // Security invariants:
-//   * Nothing executes before an explicit Allow click. Deny, window close,
-//     dialog timeout (60s), or any display failure all mean "blocked".
-//   * The command shown in the dialog is built from argv (ground truth),
-//     never from the user-writable reason file. The reason file only
-//     contributes the decorative "purpose" line and session display hints.
-//   * The child runs with a minimal environment and a fixed secure PATH so a
-//     user-controlled PATH or LD_* cannot redirect a root execution.
-//   * The shebang is absolute (/usr/bin/gjs) so PATH never selects the
-//     interpreter that runs as root.
+//   * Nothing executes before an explicit Allow. Deny, close, grace-window
+//     misfires, no display, or a dead presenter all mean "blocked".
+//   * The command that runs and the command shown for THIS row come from
+//     argv, never from the user-writable reason file. The reason file only
+//     contributes the decorative purpose line, session display hints, and
+//     pre-seeded sibling rows (which can never execute anything by
+//     themselves — each sibling runs only through its own argv).
+//   * The child runs with a minimal environment and a fixed secure PATH;
+//     the shebang is absolute so PATH never picks the root interpreter.
 
 imports.gi.versions.Gtk = "4.0";
 imports.gi.versions.Adw = "1";
-const { Gtk, Adw, GLib, Gio } = imports.gi;
+const { Gtk, Adw, GLib, Gio, Gdk } = imports.gi;
 
 const REASON_FILE = "/tmp/opencode-sudo-reason";
-const TIMEOUT_SECONDS = 60;
+const GATE_PATH = "/usr/local/bin/opencode-sudo-gate";
+// Test-only override so the presenter can be rendered from a synthetic
+// queue without root. Never set in normal use.
+const RUN_DIR = GLib.getenv("GATE_RUN_DIR") || "/run/opencode-sudo-gate";
+const QUEUE_DIR = `${RUN_DIR}/queue`;
+const SESSION_DIR = `${RUN_DIR}/session`;
+const LOCK_DIR = `${RUN_DIR}/presenter.lock`;
+const PID_FILE = `${LOCK_DIR}/pid`;
+const BROKEN_FILE = `${RUN_DIR}/broken`;
+const ETC_DIR = "/etc/opencode-sudo-gate";
+const RULES_FILE = `${ETC_DIR}/rules.json`;
 const SECURE_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 const GENERIC_PURPOSE =
   "opencode requested root to run the command below. Only approve if you expected a privileged step.";
+const XID_RE = /^[0-9a-f]{12}$/;
+const GRACE_MS = 750;
+const POLL_MS = 250;
 
 // sudo options that consume the following argument (mirrors the plugin).
 const FLAG_WITH_ARG = new Set(["-C", "-D", "-h", "-p", "-u", "-U", "-g", "-T"]);
-
-let denyReason = ""; // why the dialog ended without Allow (for the error line)
 
 // ---------------------------------------------------------------------------
 // Reason file (decorative context only)
@@ -48,7 +77,7 @@ function readReason() {
     if (!file.query_exists(null)) return {};
     const [, bytes] = file.load_contents(null);
     const raw = new TextDecoder().decode(bytes).trim();
-    if (!raw.startsWith("{")) return {}; // legacy flat-string era — ignore
+    if (!raw.startsWith("{")) return {};
     const data = JSON.parse(raw);
     return data && typeof data === "object" ? data : {};
   } catch {
@@ -58,7 +87,8 @@ function readReason() {
 
 // Session display hints captured by the plugin. Everything read from the
 // user-writable reason file is strictly validated — it may only select WHERE
-// the popup appears, never WHAT runs.
+// the popup appears and which session a "session" rule binds to, never WHAT
+// runs.
 function sessionEnv(reason) {
   const src = reason.env && typeof reason.env === "object" ? reason.env : {};
   const env = {};
@@ -75,7 +105,31 @@ function sessionEnv(reason) {
   const runtime = /^\/run\/user\/\d+$/.test(rt) ? rt : fallback;
   if (runtime) env.XDG_RUNTIME_DIR = runtime;
 
+  // User session bus: without this, root GTK/dconf see only root defaults
+  // (Adwaita, light) while every user app follows the desktop theme, accent
+  // and dark preference. Pointing at the user's bus makes the dialog resolve
+  // theme settings exactly like Nautilus and friends. Strictly validated:
+  // abstract-socket "unix:path=" form only, uid must match the runtime dir.
+  // NOTE: currently unused — the session bus closes root connections, so the
+  // gate instead applies the captured theme name + color scheme directly
+  // (see gtkThemeOf / applyColorScheme in the presenter). Kept documented
+  // here so nobody re-adds it expecting it to work.
   return env;
+}
+
+function sessionKeyOf(reason) {
+  const v = reason.env && typeof reason.env.SESSION_KEY === "string" ? reason.env.SESSION_KEY : "";
+  return /^[A-Za-z0-9_-]{1,64}$/.test(v) ? v : "";
+}
+
+function homeOf(reason) {
+  const v = reason.env && typeof reason.env.HOME === "string" ? reason.env.HOME : "";
+  return /^\/home\/[A-Za-z0-9._-]{1,64}$/.test(v) ? v : "";
+}
+
+function colorSchemeOf(reason) {
+  const v = reason.env && typeof reason.env.COLOR_SCHEME === "string" ? reason.env.COLOR_SCHEME : "";
+  return /^(default|prefer-light|prefer-dark|force-light|force-dark)$/.test(v) ? v : "";
 }
 
 // Root has no X11 authority of its own; mutter's Xwayland cookie lets the
@@ -96,37 +150,27 @@ function findXauthority(runtimeDir) {
   return "";
 }
 
-// ---------------------------------------------------------------------------
-// Dialog — returns { allowed, why }
-// ---------------------------------------------------------------------------
-
-function askAllow(displayCmd, purpose, cwd, displayHints, colorScheme) {
-  const attempt = (hints) => {
-    for (const key of Object.keys(hints)) GLib.setenv(key, hints[key], true);
+function initDisplay(hints) {
+  const attempt = (h) => {
+    for (const key of Object.keys(h)) GLib.setenv(key, h[key], true);
     try {
       return Gtk.init_check();
     } catch {
       return false;
     }
   };
-
-  // Prefer the session's Wayland display; fall back to Xwayland with the
-  // session's authority cookie if a direct Wayland connection fails.
-  let ok = attempt(displayHints);
+  let ok = attempt(hints);
   if (!ok) {
     GLib.unsetenv("WAYLAND_DISPLAY");
-    const xHints = { DISPLAY: displayHints.DISPLAY || ":0" };
-    const xa = findXauthority(displayHints.XDG_RUNTIME_DIR);
+    const xHints = { DISPLAY: hints.DISPLAY || ":0" };
+    const xa = findXauthority(hints.XDG_RUNTIME_DIR);
     if (xa) xHints.XAUTHORITY = xa;
     ok = attempt(xHints);
   }
-  if (!ok) return { allowed: false, why: "no graphical display available" };
+  return ok;
+}
 
-  Adw.init();
-
-  // Match the user's GNOME preference. The plugin captured it while running
-  // as the user (root has no dconf of its own, so libadwaita would default
-  // to light). Values are allowlisted on both sides — decorative only.
+function applyColorScheme(colorScheme) {
   const SCHEMES = {
     default: Adw.ColorScheme.DEFAULT,
     "prefer-light": Adw.ColorScheme.PREFER_LIGHT,
@@ -141,121 +185,897 @@ function askAllow(displayCmd, purpose, cwd, displayHints, colorScheme) {
       // Cosmetic — never fail the gate over theming.
     }
   }
-
-  // Canonical libadwaita approval dialog: rounded corners, dimmed backdrop,
-  // suggested response styling, Esc = close-response = deny.
-  //
-  // Stray-input safety: any response arriving within GRACE_MS of present()
-  // is DISCARDED and a fresh dialog is shown — a keystroke that lands while
-  // the window is still appearing (mid-typing Enter/Esc) must never be
-  // honored as a verdict. Keyboard focus is parked on the command label and
-  // no default response is set, so Enter alone is inert after the grace.
-  const GRACE_MS = 750;
-  let verdict = { allowed: false, why: "dialog closed" };
-  const loop = new GLib.MainLoop(null, false);
-  let currentDlg = null;
-  let rebuildId = 0;
-  let timedOut = false;
-
-  const presentAttempt = () => {
-    rebuildId = 0;
-    if (timedOut) return;
-    const shownAt = GLib.get_monotonic_time();
-
-    const dlg = new Adw.AlertDialog({
-      heading: "opencode wants root",
-      body: purpose,
-    });
-
-    // Ground truth: exactly what will be executed, straight from argv.
-    const extra = new Gtk.Box({
-      orientation: Gtk.Orientation.VERTICAL,
-      spacing: 6,
-      margin_top: 8,
-    });
-    const cmdLbl = new Gtk.Label({
-      label: displayCmd,
-      wrap: true,
-      xalign: 0,
-      selectable: true,
-      max_width_chars: 52,
-    });
-    cmdLbl.add_css_class("monospace");
-    extra.append(cmdLbl);
-    if (cwd) {
-      const cwdLbl = new Gtk.Label({
-        label: `in ${cwd.length > 72 ? "…" + cwd.slice(-71) : cwd}`,
-        wrap: true,
-        xalign: 0,
-      });
-      cwdLbl.add_css_class("dim-label");
-      cwdLbl.add_css_class("caption");
-      extra.append(cwdLbl);
-    }
-    dlg.set_extra_child(extra);
-
-    dlg.add_response("deny", "Deny");
-    dlg.add_response("allow", "Allow");
-    dlg.set_response_appearance("allow", Adw.ResponseAppearance.SUGGESTED);
-    dlg.set_close_response("deny"); // Esc denies; Enter is inert (no default)
-
-    dlg.connect("response", (_d, id) => {
-      if (GLib.get_monotonic_time() - shownAt < GRACE_MS * 1000) {
-        // Input arrived while the dialog was appearing: discard it and
-        // re-show. Covers both accidental Deny (typing Enter/Esc) and
-        // accidental Allow (stray click) — the user answers the NEXT one.
-        if (!rebuildId && !timedOut) {
-          rebuildId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 250, () => {
-            rebuildId = 0;
-            presentAttempt();
-            return GLib.SOURCE_REMOVE;
-          });
-        }
-        return;
-      }
-      verdict =
-        id === "allow" ? { allowed: true, why: "" } : { allowed: false, why: "user denied" };
-      loop.quit();
-    });
-
-    currentDlg = dlg;
-    dlg.present(null);
-    // Park focus on the command label so a stray Enter can't activate a
-    // button; Tab still reaches the buttons for keyboard users.
-    GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
-      if (currentDlg === dlg) dlg.set_focus(cmdLbl);
-      return GLib.SOURCE_REMOVE;
-    });
-  };
-
-  // Fail closed if nobody answers — ONE deadline from the first present,
-  // spanning grace re-shows.
-  const timeoutId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, TIMEOUT_SECONDS, () => {
-    timedOut = true;
-    verdict = { allowed: false, why: `timed out after ${TIMEOUT_SECONDS}s` };
-    if (rebuildId) {
-      GLib.source_remove(rebuildId);
-      rebuildId = 0;
-    }
-    if (currentDlg) {
-      try {
-        currentDlg.force_close();
-      } catch {
-        // already gone
-      }
-    }
-    loop.quit();
-    return GLib.SOURCE_REMOVE;
-  });
-
-  presentAttempt();
-  loop.run();
-  if (timeoutId && !timedOut) GLib.source_remove(timeoutId);
-  return verdict;
 }
 
 // ---------------------------------------------------------------------------
-// Command construction
+// Rules engine
+// ---------------------------------------------------------------------------
+
+// Strip // and /* */ comments without touching string contents ($schema URLs
+// contain "//"). Tolerates a trailing comma on a second pass. Returns null
+// when the result does not parse — callers treat that as "ask".
+function parseJsonc(text) {
+  const strip = (s) => {
+    let out = "";
+    let i = 0;
+    let quote = null;
+    while (i < s.length) {
+      const c = s[i];
+      if (quote) {
+        out += c;
+        if (c === "\\") {
+          if (i + 1 < s.length) {
+            out += s[i + 1];
+            i += 2;
+            continue;
+          }
+        } else if (c === quote) {
+          quote = null;
+        }
+        i++;
+        continue;
+      }
+      if (c === '"') {
+        quote = c;
+        out += c;
+        i++;
+        continue;
+      }
+      if (c === "/" && s[i + 1] === "/") {
+        while (i < s.length && s[i] !== "\n") i++;
+        continue;
+      }
+      if (c === "/" && s[i + 1] === "*") {
+        i += 2;
+        while (i < s.length && !(s[i] === "*" && s[i + 1] === "/")) i++;
+        i += 2;
+        continue;
+      }
+      out += c;
+      i++;
+    }
+    return out;
+  };
+  try {
+    return JSON.parse(strip(text));
+  } catch {
+    try {
+      return JSON.parse(strip(text).replace(/,(\s*[}\]])/g, "$1"));
+    } catch {
+      return null;
+    }
+  }
+}
+
+function readTextFile(path) {
+  try {
+    const [, bytes] = Gio.File.new_for_path(path).load_contents(null);
+    return new TextDecoder().decode(bytes);
+  } catch {
+    return null;
+  }
+}
+
+// A rules file is a plain JSON array of {action, resource, effect}.
+// Unreadable/missing ⇒ [] (no rules); unparsable/wrong shape ⇒ [] too,
+// which for the root file means "everything asks" — fail toward a prompt.
+function readRuleArray(path) {
+  const raw = readTextFile(path);
+  if (raw === null) return [];
+  const parsed = parseJsonc(raw);
+  return Array.isArray(parsed) ? parsed : [];
+}
+
+// Glob match with OpenCode's wildcards (* and ?). The pattern "x *" must
+// also match the bare command "x" (OpenCode semantics).
+function globRe(pat) {
+  let out = "^";
+  for (const ch of pat) {
+    if (ch === "*") out += "[\\s\\S]*";
+    else if (ch === "?") out += "[\\s\\S]";
+    else if ("\\.+^${}()|[]".includes(ch)) out += `\\${ch}`;
+    else out += ch;
+  }
+  return new RegExp(`${out}$`);
+}
+
+function matchResource(pattern, cmd) {
+  const forms = [pattern];
+  const bare = pattern.replace(/\s+\*$/, "");
+  if (bare !== pattern) forms.push(bare);
+  return forms.some((f) => {
+    try {
+      return globRe(f).test(cmd);
+    } catch {
+      return false;
+    }
+  });
+}
+
+// Last matching rule wins within one source (mirrors OpenCode).
+function lastMatch(rules, cmd) {
+  let out = null;
+  for (const r of rules) {
+    if (!r || typeof r !== "object") continue;
+    if (r.action !== undefined && r.action !== "shell") continue;
+    if (typeof r.resource !== "string") continue;
+    if (r.effect !== "allow" && r.effect !== "deny" && r.effect !== "ask") continue;
+    if (matchResource(r.resource, cmd)) out = r.effect;
+  }
+  return out;
+}
+
+// Discover opencode.json(c) files in OpenCode's merge order:
+// global first, then direct configs root→cwd, then .opencode configs
+// root→cwd (each directory's .json before .jsonc).
+function discoverConfigFiles(cwd, home) {
+  const files = [];
+  if (home) {
+    for (const n of ["opencode.json", "opencode.jsonc"]) files.push(`${home}/.config/opencode/${n}`);
+  }
+  const chain = [];
+  let d = GLib.canonicalize_filename(cwd || "/", "/");
+  for (;;) {
+    chain.push(d);
+    const parent = GLib.path_get_dirname(d);
+    if (parent === d) break;
+    d = parent;
+  }
+  chain.reverse();
+  for (const dir of chain) {
+    for (const n of ["opencode.json", "opencode.jsonc"]) files.push(`${dir}/${n}`);
+    for (const n of ["opencode.json", "opencode.jsonc"]) files.push(`${dir}/.opencode/${n}`);
+  }
+  return files.filter((p) => GLib.file_test(p, GLib.FileTest.IS_REGULAR));
+}
+
+const ASK_STAR = { action: "shell", resource: "*", effect: "ask" };
+
+// Layer 1: opencode.json deny/ask rules. `allow` entries are stripped — the
+// agent can write this file, so it may only tighten, never loosen.
+// Unparsable file or unknown home ⇒ conservative ask.
+function loadOcRules(cwd, home) {
+  const rules = [];
+  if (!home) rules.push(ASK_STAR);
+  for (const path of discoverConfigFiles(cwd, home)) {
+    const raw = readTextFile(path);
+    if (raw === null) continue;
+    const cfg = parseJsonc(raw);
+    if (!cfg || typeof cfg !== "object") {
+      rules.push(ASK_STAR);
+      continue;
+    }
+    const list = Array.isArray(cfg.permissions) ? cfg.permissions : [];
+    for (const r of list) {
+      if (r && typeof r === "object" && r.effect !== "allow") rules.push(r);
+    }
+  }
+  return rules;
+}
+
+function sessionPath(sessionKey) {
+  return sessionKey ? `${SESSION_DIR}/${sessionKey}.json` : "";
+}
+
+// Combine the three sources: ANY deny wins; else a root/session allow wins
+// over opencode.json's ask; else ask.
+function evalRules(cmd, opts) {
+  const oc = lastMatch(loadOcRules(opts.cwd, opts.home), cmd);
+  const root = lastMatch(readRuleArray(RULES_FILE), cmd);
+  const sp = sessionPath(opts.session);
+  const sess = sp ? lastMatch(readRuleArray(sp), cmd) : null;
+  let effect = "ask";
+  if (oc === "deny" || root === "deny" || sess === "deny") effect = "deny";
+  else if (root === "allow" || sess === "allow") effect = "allow";
+  return { effect, oc, root, sess };
+}
+
+function appendRule(path, rule) {
+  try {
+    GLib.mkdir_with_parents(GLib.path_get_dirname(path), 0o700);
+    const arr = readRuleArray(path);
+    arr.push(rule);
+    GLib.file_set_contents(path, `${JSON.stringify(arr, null, 2)}\n`);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function formatRuleList(name, path, rules) {
+  const out = [`## ${name} (${path})`];
+  if (!GLib.file_test(path, GLib.FileTest.IS_REGULAR)) {
+    out.push("  (missing)");
+    return out.join("\n");
+  }
+  if (!rules.length) out.push("  (empty)");
+  rules.forEach((r, i) => {
+    const action = r && r.action !== undefined ? r.action : "shell";
+    const res = r && typeof r.resource === "string" ? JSON.stringify(r.resource) : "<bad>";
+    const eff = r && r.effect !== undefined ? r.effect : "<bad>";
+    out.push(`  [${i}] ${action} ${res} -> ${eff}`);
+  });
+  return out.join("\n");
+}
+
+function printRules() {
+  const cwd = GLib.get_current_dir();
+  const reason = readReason();
+  const home = homeOf(reason);
+  const files = discoverConfigFiles(cwd, home);
+  const seen = new Set();
+  for (const f of files) {
+    if (seen.has(f)) continue;
+    seen.add(f);
+    const cfg = parseJsonc(readTextFile(f) || "");
+    const list = Array.isArray(cfg && cfg.permissions)
+      ? cfg.permissions.filter((r) => !(r && r.effect === "allow"))
+      : [];
+    if (!list.length && (!cfg || !Array.isArray(cfg.permissions))) {
+      print(formatRuleList("opencode config", f, []));
+      print("  (unparsable or missing permissions — treated as ask)");
+      continue;
+    }
+    print(formatRuleList("opencode config (allow entries ignored)", f, list));
+  }
+  print(formatRuleList("always rules (root)", RULES_FILE, readRuleArray(RULES_FILE)));
+  let sessionFiles = [];
+  try {
+    const dir = Gio.File.new_for_path(SESSION_DIR);
+    const en = dir.enumerate_children("standard::name", Gio.FileQueryInfoFlags.NONE, null);
+    let info;
+    while ((info = en.next_file(null))) {
+      const n = info.get_name();
+      if (n.endsWith(".json")) sessionFiles.push(`${SESSION_DIR}/${n}`);
+    }
+  } catch {
+    // dir may not exist yet
+  }
+  if (!sessionFiles.length) print(`## session rules (${SESSION_DIR})\n  (none)`);
+  for (const f of sessionFiles) print(formatRuleList("session rules", f, readRuleArray(f)));
+}
+
+function printRulesCheck(cmd) {
+  const reason = readReason();
+  const opts = { cwd: GLib.get_current_dir(), home: homeOf(reason), session: sessionKeyOf(reason) };
+  const r = evalRules(cmd, opts);
+  print(`command: ${cmd}`);
+  print(`opencode config: ${r.oc === null ? "(no match)" : r.oc}`);
+  print(`always rules:    ${r.root === null ? "(no match)" : r.root}`);
+  print(`session rules:   ${r.sess === null ? "(no match)" : r.sess}`);
+  print(`=> ${r.effect.toUpperCase()}`);
+}
+
+// ---------------------------------------------------------------------------
+// Queue (shared between waiters and the presenter)
+// ---------------------------------------------------------------------------
+
+function ensureRunDirs() {
+  GLib.mkdir_with_parents(QUEUE_DIR, 0o700);
+  GLib.mkdir_with_parents(SESSION_DIR, 0o700);
+}
+
+function entryPath(xid) {
+  return `${QUEUE_DIR}/${xid}.json`;
+}
+
+function readEntry(xid) {
+  if (!XID_RE.test(xid)) return null;
+  const raw = readTextFile(entryPath(xid));
+  if (raw === null) return null;
+  try {
+    const e = JSON.parse(raw);
+    return e && typeof e === "object" && e.xid === xid ? e : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeEntry(e) {
+  try {
+    GLib.file_set_contents(entryPath(e.xid), JSON.stringify(e));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function unlinkEntry(xid) {
+  try {
+    Gio.File.new_for_path(entryPath(xid)).delete(null);
+  } catch {
+    // already gone
+  }
+}
+
+function listEntries() {
+  const out = [];
+  let en;
+  try {
+    en = Gio.File.new_for_path(QUEUE_DIR).enumerate_children(
+      "standard::name",
+      Gio.FileQueryInfoFlags.NONE,
+      null,
+    );
+  } catch {
+    return out;
+  }
+  let info;
+  while ((info = en.next_file(null))) {
+    const n = info.get_name();
+    if (!n.endsWith(".json")) continue;
+    const xid = n.slice(0, -5);
+    if (!XID_RE.test(xid)) continue;
+    const e = readEntry(xid);
+    if (e) out.push(e);
+  }
+  out.sort((a, b) => (a.ts - b.ts) || (a.xid < b.xid ? -1 : a.xid > b.xid ? 1 : 0));
+  return out;
+}
+
+function mkEntry(xid, text, purpose, cwd, session) {
+  return {
+    v: 1,
+    xid,
+    text,
+    purpose: String(purpose || GENERIC_PURPOSE).slice(0, 300),
+    cwd: String(cwd || "").slice(0, 400),
+    session,
+    ts: Math.floor(Date.now() / 1000),
+    status: "pending",
+    rule: null,
+    why: null,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Presenter lifecycle (one detached window process)
+// ---------------------------------------------------------------------------
+
+function selfPath() {
+  try {
+    const [, bytes] = Gio.File.new_for_path("/proc/self/cmdline").load_contents(null);
+    const parts = new TextDecoder().decode(bytes).split("\0").filter(Boolean);
+    const script = parts.find((p) => p.endsWith("opencode-sudo-gate"));
+    if (script) return script;
+  } catch {
+    // fall through
+  }
+  return GATE_PATH;
+}
+
+function readPidFile() {
+  const raw = readTextFile(PID_FILE);
+  if (raw === null) return 0;
+  const s = raw.trim();
+  return /^\d+$/.test(s) ? parseInt(s, 10) : 0;
+}
+
+function pidAlive(pid) {
+  if (!pid) return false;
+  if (!GLib.file_test(`/proc/${pid}`, GLib.FileTest.IS_DIR)) return false;
+  try {
+    const [, b] = Gio.File.new_for_path(`/proc/${pid}/cmdline`).load_contents(null);
+    return new TextDecoder().decode(b).includes("opencode-sudo-gate");
+  } catch {
+    return false;
+  }
+}
+
+function presenterAlive() {
+  return pidAlive(readPidFile());
+}
+
+function myPid() {
+  try {
+    return parseInt(GLib.file_read_link("/proc/self"), 10) || 0;
+  } catch {
+    return 0;
+  }
+}
+
+// Remove the lock only if we own it (guards against a respawned presenter).
+function cleanupLock() {
+  const pid = myPid();
+  if (pid && readPidFile() === pid) {
+    try {
+      Gio.File.new_for_path(PID_FILE).delete(null);
+    } catch {}
+    try {
+      Gio.File.new_for_path(LOCK_DIR).delete(null);
+    } catch {}
+  }
+}
+
+// Make sure a presenter is running. Atomic mkdir doubles as the mutex: if
+// another waiter just won the race, assume it will spawn. Stale locks (dead
+// pid) are cleared first. Returns false only when a spawn could not start.
+function ensurePresenter() {
+  if (presenterAlive()) return true;
+  try {
+    Gio.File.new_for_path(BROKEN_FILE).delete(null);
+  } catch {}
+  const stalePid = readPidFile();
+  if (stalePid) {
+    try {
+      Gio.File.new_for_path(PID_FILE).delete(null);
+    } catch {}
+  }
+  if (GLib.file_test(LOCK_DIR, GLib.FileTest.IS_DIR) && !presenterAlive()) {
+    try {
+      Gio.File.new_for_path(LOCK_DIR).delete(null); // empty besides pid (gone)
+    } catch {
+      // non-empty leftover: fall through to mkdir failure path
+    }
+  }
+  try {
+    Gio.File.new_for_path(LOCK_DIR).make_directory(null); // throws if exists
+  } catch {
+    // EEXIST = a concurrent waiter won the race and will spawn (the waiter
+    // re-checks liveness every poll and self-retries); other failures fall
+    // through as "not alive", which the waiter counts before denying.
+    return true;
+  }
+  try {
+    const proc = Gio.Subprocess.new(
+      ["/usr/bin/setsid", selfPath(), "--present"],
+      Gio.SubprocessFlags.NONE,
+    );
+    GLib.file_set_contents(PID_FILE, proc.get_identifier() || "0");
+    return true;
+  } catch {
+    try {
+      Gio.File.new_for_path(LOCK_DIR).delete(null);
+    } catch {}
+    return false;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Waiter: block until this entry is decided. No timeout — deciding is up to
+// the user. Fail closed if the display is broken or the presenter keeps
+// dying.
+// ---------------------------------------------------------------------------
+
+function waitForVerdict(entry) {
+  let spawnTries = 0;
+  for (;;) {
+    const e = readEntry(entry.xid);
+    if (e && e.status && e.status !== "pending") {
+      unlinkEntry(entry.xid);
+      return {
+        allowed: e.status === "allowed",
+        why: e.status === "allowed" ? "" : e.why || "user denied",
+      };
+    }
+    if (!e && !writeEntry(entry)) {
+      return { allowed: false, why: "approval queue unavailable" };
+    } // cleaned before we read (rare) — requeue
+    if (GLib.file_test(BROKEN_FILE, GLib.FileTest.IS_REGULAR)) {
+      return { allowed: false, why: "no graphical display available" };
+    }
+    if (!presenterAlive()) {
+      spawnTries++;
+      if (spawnTries > 3) return { allowed: false, why: "approval window unavailable" };
+      ensurePresenter();
+    } else {
+      spawnTries = 0;
+    }
+    GLib.usleep(POLL_MS * 1000);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Presenter: the Adwaita window
+// ---------------------------------------------------------------------------
+
+// Everything below uses stock Adwaita styling only — no custom CSS. One
+// shared PROVIDER_PRIORITY look: plain Adw window + headerbar, a boxed
+// list, and five standard footer buttons (destructive for Deny, suggested
+// for Allow once, regular for the rest). This is the same stock button
+// language as GNOME's own dialogs.
+function ruleFor(entry, effect) {
+  return {
+    action: "shell",
+    resource: entry.text,
+    effect: effect === "allowed" ? "allow" : "deny",
+  };
+}
+
+// Development harness (GATE_SNAPSHOT): render the presented window to a PNG
+// from inside the process, so the real GTK output can be eyeballed without a
+// desktop screenshot. Never used in normal operation.
+function snapshotWindow(win, path) {
+  try {
+    const paintable = new Gtk.WidgetPaintable({ widget: win });
+    const w = Math.max(win.get_width(), 400);
+    const h = Math.max(win.get_height(), 200);
+    const snap = Gtk.Snapshot.new();
+    paintable.snapshot(snap, w, h);
+    const node = snap.to_node();
+    if (!node) return false;
+    const tex = win.get_native().get_renderer().render_texture(node, null);
+    if (!tex) return false;
+    tex.save_to_png(path);
+    return true;
+  } catch (e) {
+    printerr(`opencode-sudo-gate: snapshot failed: ${e.message}`);
+    return false;
+  }
+}
+
+function gtkThemeOf(reason) {
+  const v = reason.env && typeof reason.env.GTK_THEME === "string" ? reason.env.GTK_THEME : "";
+  return /^[A-Za-z0-9_-]{1,64}$/.test(v) ? v : "";
+}
+
+// Yaru accent colors, extracted from libadwaita's own embedded stylesheets
+// (default-{light,dark}-yaru-<accent>.css): the only way to recolor the
+// dialog, since yaru-accent/accent-color are read-only and derived from the
+// user session portal that root cannot reach. Keyed by the allowlisted
+// ACCENT_COLOR the plugin captures; theme preferences only.
+const ACCENT_VARS = {
+  blue: { light: ["#0073E5", "#0073E5"], dark: ["#369bff", "#0070de"] },
+  teal: { light: ["#308280", "#308280"], dark: ["#3ea7a4", "#2e7e7c"] },
+  green: { light: ["#4B8501", "#4B8501"], dark: ["#60aa01", "#488001"] },
+  yellow: { light: ["#C88800", "#C88800"], dark: ["#cd8b00", "#9a6800"] },
+  orange: { light: ["#E95420", "#E95420"], dark: ["#ed754b", "#cb4314"] },
+  red: { light: ["#DA3450", "#DA3450"], dark: ["#e67588", "#d82b48"] },
+  pink: { light: ["#B34CB3", "#B34CB3"], dark: ["#c87ec8", "#ae4aae"] },
+  purple: { light: ["#7764D8", "#7764D8"], dark: ["#9b8de2", "#7360d7"] },
+  slate: { light: ["#657B69", "#657B69"], dark: ["#889d8c", "#627766"] },
+};
+
+function accentColorOf(reason) {
+  const v = reason.env && typeof reason.env.ACCENT_COLOR === "string" ? reason.env.ACCENT_COLOR : "";
+  return Object.hasOwn(ACCENT_VARS, v) ? v : "";
+}
+
+function applyAccent(accent, dark) {
+  const pair = ACCENT_VARS[accent] ? ACCENT_VARS[accent][dark ? "dark" : "light"] : null;
+  if (!pair) return;
+  try {
+    const provider = new Gtk.CssProvider();
+    provider.load_from_string(
+      `* { --accent-color: ${pair[0]}; --accent-bg-color: ${pair[1]}; ` +
+        `--yaru-accent-color: ${pair[0]}; --yaru-accent-bg-color: ${pair[1]}; }`,
+    );
+    Gtk.StyleContext.add_provider_for_display(
+      Gdk.Display.get_default(),
+      provider,
+      Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
+    );
+  } catch {
+    // Cosmetic — never fail the gate over theming.
+  }
+}
+
+function runPresenter() {
+  const reason = readReason();
+  // Dedicated root-owned dconf profile (accent baked at install time).
+  // Must precede ALL GTK/GSettings use — the backend is chosen on first
+  // access, which happens inside Gtk.init_check() below.
+  try {
+    GLib.setenv("DCONF_PROFILE", "opencode-sudo-gate", true);
+  } catch {
+    // Cosmetic — never fail the gate over theming.
+  }
+  const hints = sessionEnv(reason);
+  for (const k of Object.keys(hints)) GLib.setenv(k, hints[k], true);
+
+  if (!initDisplay(hints)) {
+    try {
+      GLib.file_set_contents(BROKEN_FILE, String(Date.now()));
+    } catch {}
+    cleanupLock();
+    return 1;
+  }
+  // Desktop theme via Settings (never GTK_THEME env — that bypasses
+  // libadwaita and renders unstyled). Same path desktop apps use; Ubuntu's
+  // libadwaita derives its Yaru accent from the theme name. Set before
+  // Adw.init(), matching probe order that rendered warning-free.
+  const gtkTheme = gtkThemeOf(reason);
+  if (gtkTheme) {
+    try {
+      Gtk.Settings.get_default().gtk_theme_name = gtkTheme;
+    } catch {
+      // Cosmetic — never fail the gate over theming.
+    }
+  }
+  // (Accent itself arrives via DCONF_PROFILE, set at presenter start.)
+  Adw.init();
+  const scheme = colorSchemeOf(reason);
+  applyColorScheme(scheme);
+  // Recolor to the user's Yaru accent (see ACCENT_VARS). APPLICATION
+  // priority overrides libadwaita's fallback orange for this dialog only.
+  applyAccent(accentColorOf(reason), scheme === "prefer-dark" || scheme === "force-dark");
+  ensureRunDirs();
+
+  const loop = new GLib.MainLoop(null, false);
+  const rows = new Map(); // xid -> {row, cb, chip}
+  let shownAt = 0;
+  let visible = false;
+  let closeId = 0;
+  let programmaticClose = false;
+
+  const win = new Adw.Window({ title: "opencode wants root" });
+  const tv = new Adw.ToolbarView();
+  const header = new Adw.HeaderBar();
+  const titleW = new Adw.WindowTitle({
+    title: "opencode wants root",
+    subtitle: "waiting…",
+  });
+  header.set_title_widget(titleW);
+  tv.add_top_bar(header);
+
+  // Select-all sits above the command list, not with the approval buttons.
+  const selectBar = new Gtk.Box({
+    orientation: Gtk.Orientation.HORIZONTAL,
+    margin_top: 12,
+    margin_bottom: 4,
+    margin_start: 20,
+    margin_end: 20,
+    valign: Gtk.Align.CENTER,
+  });
+  const selectAll = new Gtk.CheckButton({ label: "Select all", active: true, valign: Gtk.Align.CENTER });
+  selectBar.append(selectAll);
+
+  const list = new Gtk.ListBox({ selection_mode: Gtk.SelectionMode.NONE });
+  list.add_css_class("boxed-list");
+  const scroll = new Gtk.ScrolledWindow({
+    child: list,
+    hscrollbar_policy: Gtk.PolicyType.NEVER,
+    vscrollbar_policy: Gtk.PolicyType.AUTOMATIC,
+    propagate_natural_height: true,
+    min_content_height: 200,
+    vexpand: true,
+  });
+  const contentBox = new Gtk.Box({ orientation: Gtk.Orientation.VERTICAL });
+  contentBox.append(selectBar);
+  contentBox.append(scroll);
+  tv.set_content(contentBox);
+
+  // Footer: just the five approval buttons, right-aligned — every option is
+  // a single click. Deny buttons are destructive, "Allow once" is the
+  // suggested action, the rest are regular. No custom CSS anywhere.
+  const footer = new Gtk.Box({
+    orientation: Gtk.Orientation.HORIZONTAL,
+    spacing: 12,
+    margin_top: 16,
+    margin_bottom: 16,
+    margin_start: 20,
+    margin_end: 20,
+    valign: Gtk.Align.CENTER,
+  });
+  const spacer = new Gtk.Box({ orientation: Gtk.Orientation.HORIZONTAL });
+  spacer.set_hexpand(true);
+  footer.append(spacer);
+
+  const denyOnceB = new Gtk.Button({ label: "Deny" });
+  denyOnceB.add_css_class("destructive-action");
+  const denyAlwaysB = new Gtk.Button({ label: "Always deny" });
+  denyAlwaysB.add_css_class("destructive-action");
+  const allowOnceB = new Gtk.Button({ label: "Allow once" });
+  allowOnceB.add_css_class("suggested-action");
+  const allowSessB = new Gtk.Button({ label: "Allow this session" });
+  const allowAlwaysB = new Gtk.Button({ label: "Always allow" });
+  footer.append(denyOnceB);
+  footer.append(denyAlwaysB);
+  const sep = new Gtk.Separator({
+    orientation: Gtk.Orientation.VERTICAL,
+    margin_top: 6,
+    margin_bottom: 6,
+    margin_start: 2,
+    margin_end: 2,
+  });
+  footer.append(sep);
+  footer.append(allowOnceB);
+  footer.append(allowSessB);
+  footer.append(allowAlwaysB);
+  tv.add_bottom_bar(footer);
+  win.set_content(tv);
+
+  const checkedPending = () => {
+    const out = [];
+    for (const [xid, r] of rows) {
+      if (r.cb.active && r.cb.sensitive) out.push(xid);
+    }
+    return out;
+  };
+
+  let syncingAll = false; // suppress the "All" handler during programmatic sync
+  const updateChrome = (pendingCount) => {
+    const n = checkedPending().length;
+    const on = pendingCount > 0 && n > 0;
+    for (const b of [denyOnceB, denyAlwaysB, allowOnceB, allowSessB, allowAlwaysB]) b.sensitive = on;
+    titleW.set_subtitle(pendingCount ? `${pendingCount} pending` : "all decided");
+    syncingAll = true;
+    selectAll.active = pendingCount > 0 && n === pendingCount;
+    syncingAll = false;
+  };
+
+  const markDecided = (entry) => {
+    const r = rows.get(entry.xid);
+    if (!r) return;
+    r.cb.active = false;
+    r.cb.sensitive = false;
+    const scope =
+      entry.rule === "always" ? " · always" : entry.rule === "session" ? " · this session" : "";
+    r.state.label = `${entry.status}${scope}`;
+    r.state.remove_css_class("success");
+    r.state.remove_css_class("error");
+    r.state.add_css_class(entry.status === "allowed" ? "success" : "error");
+    r.state.set_visible(true);
+  };
+
+  const apply = (effect, scope) => {
+    if (shownAt && GLib.get_monotonic_time() - shownAt < GRACE_MS * 1000) return;
+    for (const xid of checkedPending()) {
+      const entry = readEntry(xid);
+      if (!entry || entry.status !== "pending") continue;
+      entry.status = effect;
+      entry.rule = scope;
+      entry.why = effect === "allowed" ? "user allowed" : "user denied";
+      // Do not show a decision in the UI unless the waiter can observe it.
+      // A failed queue write must leave the row pending so the user can retry.
+      if (!writeEntry(entry)) continue;
+      if (scope === "always") appendRule(RULES_FILE, ruleFor(entry, effect));
+      if (scope === "session" && entry.session) {
+        appendRule(sessionPath(entry.session), ruleFor(entry, effect));
+      }
+      markDecided(entry);
+    }
+    // refresh counts from the queue (entries we just wrote)
+    updateChrome(listEntries().filter((e) => e.status === "pending").length);
+  };
+
+  denyOnceB.connect("clicked", () => apply("denied", "once"));
+  denyAlwaysB.connect("clicked", () => apply("denied", "always"));
+  allowOnceB.connect("clicked", () => apply("allowed", "once"));
+  allowSessB.connect("clicked", () => apply("allowed", "session"));
+  allowAlwaysB.connect("clicked", () => apply("allowed", "always"));
+
+  selectAll.connect("toggled", () => {
+    if (syncingAll) return;
+    if (shownAt && GLib.get_monotonic_time() - shownAt < GRACE_MS * 1000) return;
+    for (const r of rows.values()) {
+      if (r.cb.sensitive) r.cb.active = selectAll.active;
+    }
+    updateChrome(listEntries().filter((e) => e.status === "pending").length);
+  });
+
+  const makeRow = (entry) => {
+    const row = new Gtk.ListBoxRow({ activatable: false, selectable: false });
+    const box = new Gtk.Box({
+      orientation: Gtk.Orientation.HORIZONTAL,
+      spacing: 16,
+      margin_top: 20,
+      margin_bottom: 20,
+      margin_start: 20,
+      margin_end: 20,
+    });
+    const cb = new Gtk.CheckButton({ active: true, valign: Gtk.Align.START });
+    const textBox = new Gtk.Box({
+      orientation: Gtk.Orientation.VERTICAL,
+      spacing: 6,
+      hexpand: true,
+    });
+    const cmd = new Gtk.Label({ label: entry.text, xalign: 0, wrap: true, selectable: true });
+    cmd.add_css_class("monospace");
+    cmd.add_css_class("title-4");
+    textBox.append(cmd);
+    if (entry.purpose) {
+      const p = new Gtk.Label({ label: entry.purpose, xalign: 0, wrap: true });
+      p.add_css_class("caption");
+      p.add_css_class("dim-label");
+      textBox.append(p);
+    }
+    const state = new Gtk.Label({ label: "", valign: Gtk.Align.CENTER });
+    box.append(cb);
+    box.append(textBox);
+    box.append(state);
+    row.set_child(box);
+    cb.connect("toggled", () =>
+      updateChrome(listEntries().filter((e) => e.status === "pending").length),
+    );
+    list.append(row);
+    const refs = { row, cb, state };
+    rows.set(entry.xid, refs);
+    if (entry.status !== "pending") markDecided(entry);
+    return refs;
+  };
+
+  const denyPending = (why) => {
+    for (const entry of listEntries()) {
+      if (entry.status !== "pending") continue;
+      entry.status = "denied";
+      entry.rule = "once";
+      entry.why = why;
+      writeEntry(entry);
+    }
+  };
+
+  // close/X/Esc: grace-guarded; denies everything still undecided.
+  const handleClose = (programmatic) => {
+    if (!programmatic && shownAt && GLib.get_monotonic_time() - shownAt < GRACE_MS * 1000) {
+      return true; // stray close while the window is appearing — ignore
+    }
+    if (!programmatic) denyPending("window closed");
+    cleanupLock();
+    loop.quit();
+    return false;
+  };
+  win.connect("close-request", () => handleClose(programmaticClose));
+
+  const keyCtl = new Gtk.EventControllerKey();
+  win.add_controller(keyCtl);
+  keyCtl.connect("key-pressed", (_c, keyval) => {
+    if (keyval === Gdk.KEY_Escape) {
+      if (!handleClose(false)) win.close();
+      return true;
+    }
+    return false;
+  });
+
+  // Reap decided entries nobody consumed (killed waiters) after they have
+  // certainly been read by any live waiter (poll interval ≪ this).
+  const reapDecided = () => {
+    const now = Math.floor(Date.now() / 1000);
+    for (const e of listEntries()) {
+      if (e.status !== "pending" && now - (e.ts || 0) > 30) unlinkEntry(e.xid);
+    }
+  };
+
+  GLib.timeout_add(GLib.PRIORITY_DEFAULT, POLL_MS, () => {
+    const entries = listEntries();
+    const pending = entries.filter((e) => e.status === "pending");
+
+    for (const e of entries) {
+      if (!rows.has(e.xid)) makeRow(e);
+      else if (e.status !== "pending") markDecided(e);
+    }
+    updateChrome(pending.length);
+    reapDecided();
+
+    if (pending.length > 0 && !visible) {
+      visible = true;
+      shownAt = GLib.get_monotonic_time();
+      // Deterministic size: header + up to five rows + footer, capped so long
+      // batches scroll instead of growing without bound.
+      const rowsN = Math.min(pending.length, 5);
+      win.set_default_size(860, Math.min(Math.max(116 + rowsN * 108 + 92, 340), 720));
+      win.present();
+      GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
+        win.set_focus(list);
+        return GLib.SOURCE_REMOVE;
+      });
+      const snapPath = GLib.getenv("GATE_SNAPSHOT");
+      if (snapPath) {
+        GLib.timeout_add(GLib.PRIORITY_DEFAULT, 900, () => {
+          snapshotWindow(win, snapPath);
+          return GLib.SOURCE_REMOVE;
+        });
+      }
+    }
+
+    if (pending.length === 0 && visible && !closeId) {
+      closeId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1000, () => {
+        closeId = 0;
+        if (listEntries().some((e) => e.status === "pending")) return GLib.SOURCE_REMOVE;
+        programmaticClose = true;
+        win.close();
+        return GLib.SOURCE_REMOVE;
+      });
+    }
+    return GLib.SOURCE_CONTINUE;
+  });
+
+  loop.run();
+  return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Command construction (executor)
 // ---------------------------------------------------------------------------
 
 // Round-trip an argv token back into shell source so `sh -c` reproduces the
@@ -374,48 +1194,128 @@ function runChild(parsed) {
 // Entry
 // ---------------------------------------------------------------------------
 
+function randomXid() {
+  try {
+    return GLib.uuid_string_random().replace(/-/g, "").slice(0, 12);
+  } catch {
+    return Math.floor(Math.random() * 0xffffffffffff).toString(16).padStart(12, "0");
+  }
+}
+
+function purposeFor(reason, xid, displayCmd) {
+  if (Array.isArray(reason.batch)) {
+    const mine = reason.batch.find((b) => b && b.xid === xid && typeof b.purpose === "string");
+    if (mine && mine.purpose.trim()) return mine.purpose.trim().slice(0, 300);
+  }
+  if (
+    typeof reason.command === "string" &&
+    reason.command === displayCmd &&
+    typeof reason.purpose === "string" &&
+    reason.purpose.trim()
+  ) {
+    return reason.purpose.trim().slice(0, 300);
+  }
+  return GENERIC_PURPOSE;
+}
+
+// Pre-seed sibling rows from the reason file so ONE window covers a whole
+// multi-sudo shell line (or a batch a parallel call wrote). Entries are
+// display-only: each sibling executes solely through its own later argv —
+// a forged entry can never run anything.
+function preseedBatch(reason, ownXid, cwd, session) {
+  if (!Array.isArray(reason.batch)) return;
+  for (const b of reason.batch) {
+    if (!b || typeof b.xid !== "string" || !XID_RE.test(b.xid) || b.xid === ownXid) continue;
+    if (typeof b.command !== "string" || !/^sudo \S/.test(b.command)) continue;
+    const text = b.command.replace(/\s+/g, " ").trim().slice(0, 800);
+    if (!text || readEntry(b.xid)) continue;
+    writeEntry(mkEntry(b.xid, text, b.purpose, cwd, session));
+  }
+}
+
 function main() {
   const args = [...ARGV];
+
   if (args[0] === "--selftest") {
     // Non-interactive probe used by scripts/install-system.js to prove the
     // sudoers rule works. Shows no dialog, executes nothing.
     print("ok");
     return 0;
   }
-  if (args[0] === "--") args.shift();
-  if (!args.length) {
+  if (args[0] === "--present") return runPresenter();
+  if (args[0] === "--rules") {
+    printRules();
+    return 0;
+  }
+  if (args[0] === "--rules-check") {
+    printRulesCheck(args.slice(1).join(" ").trim());
+    return 0;
+  }
+
+  // Parse [--xid=<hex>] [--] <command tokens...>
+  let xid = "";
+  const rest = [];
+  for (const a of args) {
+    if (a.startsWith("--xid=")) {
+      const v = a.slice(6);
+      if (XID_RE.test(v)) xid = v;
+      continue;
+    }
+    rest.push(a);
+  }
+  const dash = rest.indexOf("--");
+  const tokens = dash >= 0 ? rest.slice(dash + 1) : rest;
+  if (!tokens.length) {
     printerr("opencode-sudo-gate: no command given");
     return 1;
   }
+  if (!xid) xid = randomXid();
 
   const reason = readReason();
-  const parsed = stripSudoFlags(args);
+  const parsed = stripSudoFlags(tokens);
   if (!parsed.rest) {
     printerr("opencode-sudo-gate: blocked: empty command after sudo options");
     return 1;
   }
 
   const displayCmd = `sudo ${parsed.rest}`;
-  const purpose =
-    typeof reason.purpose === "string" && reason.purpose.trim()
-      ? reason.purpose.trim().slice(0, 300)
-      : GENERIC_PURPOSE;
   const cwd = GLib.get_current_dir();
+  const session = sessionKeyOf(reason);
 
-  // Color scheme comes from the user-writable reason file — allowlist it
-  // again here; anything unrecognized means "let libadwaita decide".
-  const rawScheme =
-    reason.env && typeof reason.env.COLOR_SCHEME === "string" ? reason.env.COLOR_SCHEME : "";
-  const colorScheme = /^(default|prefer-light|prefer-dark|force-light|force-dark)$/.test(rawScheme)
-    ? rawScheme
-    : "";
+  // Fast path: persistent rules answer without any dialog.
+  const rule = evalRules(displayCmd, { cwd, home: homeOf(reason), session });
+  if (rule.effect === "deny") {
+    printerr(`opencode-sudo-gate: BLOCKED ${displayCmd} (denied by rules)`);
+    return 1;
+  }
+  if (rule.effect === "allow") return runChild(parsed);
 
-  const verdict = askAllow(displayCmd, purpose, cwd, sessionEnv(reason), colorScheme);
+  // Ask path: shared queue + one detached presenter window.
+  const hints = sessionEnv(reason);
+  for (const k of Object.keys(hints)) GLib.setenv(k, hints[k], true);
+  ensureRunDirs();
+
+  const entry = mkEntry(xid, displayCmd, purposeFor(reason, xid, displayCmd), cwd, session);
+  // A sibling row may already have been approved while this command was
+  // waiting for an earlier command in the same shell line. Preserve that
+  // verdict: replacing the pre-seeded row here would turn an approval back
+  // into "pending" and strand the command behind another popup.
+  if (!readEntry(xid) && !writeEntry(entry)) {
+    printerr(`opencode-sudo-gate: BLOCKED ${displayCmd} (approval queue unavailable)`);
+    return 1;
+  }
+  preseedBatch(reason, xid, cwd, session);
+
+  if (!ensurePresenter()) {
+    printerr(`opencode-sudo-gate: BLOCKED ${displayCmd} (approval window unavailable)`);
+    return 1;
+  }
+
+  const verdict = waitForVerdict(entry);
   if (!verdict.allowed) {
     printerr(`opencode-sudo-gate: BLOCKED ${displayCmd} (${verdict.why})`);
     return 1;
   }
-
   return runChild(parsed);
 }
 

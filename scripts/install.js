@@ -93,7 +93,7 @@ async function main() {
   const rc = await cleanShellRc()
   for (const f of rc) console.log(`[opencode-sudo-popup] removed SUDO_ASKPASS wiring from ${f}`)
 
-  console.log("[opencode-sudo-popup] next: npm run install-system  (installs the root-owned gate + sudoers rule via run0)")
+  console.log("[opencode-sudo-popup] next: sudo $(command -v node) scripts/install-system.js  (root-owned gate + sudoers rule; the approval gate will ask you once)")
 }
 
 main().catch((e) => {
