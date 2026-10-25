@@ -601,7 +601,12 @@ function ensurePresenter() {
       Gio.File.new_for_path(PID_FILE).delete(null);
     } catch {}
   }
-  if (GLib.file_test(LOCK_DIR, GLib.FileTest.IS_DIR) && !presenterAlive()) {
+  // A lock directory with no pid file is not stale: the process that just
+  // created it may still be between mkdir and publishing its pid. Removing
+  // it in that window lets another waiter win mkdir too, starting a second
+  // presenter for the same queue. Leave this startup lock alone; waiters
+  // poll and retry if the owner never manages to spawn.
+  if (GLib.file_test(LOCK_DIR, GLib.FileTest.IS_DIR) && stalePid && !presenterAlive()) {
     try {
       Gio.File.new_for_path(LOCK_DIR).delete(null); // empty besides pid (gone)
     } catch {
