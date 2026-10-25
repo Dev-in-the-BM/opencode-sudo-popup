@@ -3,9 +3,10 @@
 A deterministic sudo approval gate for [OpenCode](https://opencode.ai) **V2**.
 
 When opencode needs root, the plugin rewrites the command so it can only run
-through a root-owned gate program. The gate pops up a native **Adwaita**
-dialog showing exactly which command is about to run — click **Allow** and it
-executes as root, click **Deny** (or don't answer) and it's blocked.
+through a root-owned gate program. The gate requests approval in the GNOME
+Shell extension when available, otherwise it shows a native **Adwaita**
+dialog. Both show exactly which command is about to run; **Allow** runs it as
+root, while **Deny** (or no answer) blocks it.
 
 No password prompts, no interrupted workflow: every privileged command gets
 one explicit approval — or none.
@@ -37,6 +38,7 @@ authenticate in opencode's non-interactive shells, so it fails closed too.
 - Linux with `sudo` (tested with sudo-rs)
 - **OpenCode V2**
 - GJS + GTK4 + libadwaita (native on GNOME) for the dialog
+- GNOME Shell 49+ for the optional session indicator
 - `run0` (polkit) to install the root-owned files
 - A session display (Wayland or X11)
 
@@ -50,6 +52,28 @@ npm run install-system  # ONE polkit prompt: root-owned gate + sudoers rule
 ```
 
 Restart opencode after installing so the plugin is loaded at startup.
+
+## GNOME Shell extension
+
+The extension adds a panel indicator with **Currently running** and **Recently
+used** tabs, and displays pending sudo requests with **Deny**, **Allow once**,
+and **Allow session** actions. Session data is read-only (using the system
+Python 3 SQLite module). Install it with:
+
+```bash
+npm run install-extension
+gnome-extensions enable opencode-sudo-popup@uvindusl.github.io
+```
+
+To build an installable GNOME extension archive, run `npm run pack-extension`.
+
+The existing standalone dialog remains as the fail-closed fallback when the
+extension is unavailable or its bridge cannot be authenticated. The bridge
+uses an abstract Unix socket (no writable queue or socket file); Shell accepts
+only root peers, and the gate verifies the connected peer is the target user's
+GNOME Shell process in its session-manager cgroup. If those checks fail, the
+gate uses the standalone dialog instead. The gate binary is installed
+root-owned, so after changing it, run `npm run install-system` again.
 
 `npm run install-system` stages both files, then asks polkit (via `run0`) to:
 
@@ -78,8 +102,11 @@ Restart opencode after installing so the plugin is loaded at startup.
   non-interactive opencode shells don't have → fails closed.
 - The gate is root-owned under `/usr/local/bin`: the agent (running as your
   user) cannot edit the program that decides what runs as root.
-- The dialog runs *inside* the root-authorized program (pkexec model) —
-  clicking Allow **is** the authentication.
+- Only the root-owned gate reads/writes the approval queue and executes
+  commands. The extension receives requests over an abstract Unix socket;
+  same-user peers are rejected, and the gate verifies the peer's uid,
+  executable, session-manager cgroup, and ownership of the active
+  `org.gnome.Shell` D-Bus name before trusting decisions.
 - The displayed command comes from argv, never from the user-writable
   reason file; reason-file content is allowlisted/validated before use.
 - The child runs with a fixed secure `PATH`, `HOME/USER/LOGNAME=/root`, and

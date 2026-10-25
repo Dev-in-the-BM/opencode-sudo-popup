@@ -1,0 +1,8 @@
+{
+  "uuid": "opencode-sudo-popup@uvindusl.github.io",
+  "name": "OpenCode Sudo Approval",
+  "description": "View OpenCode sessions and manage privileged-command approvals",
+  "version": 1,
+  "shell-version": ["49", "50"],
+  "url": "https://github.com/uvindusl/opencode-sudo-popup"
+}

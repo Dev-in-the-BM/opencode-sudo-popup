@@ -674,6 +674,179 @@ function waitForVerdict(entry) {
 // Presenter: the Adwaita window
 // ---------------------------------------------------------------------------
 
+// Prefer the GNOME Shell extension when it is available. The abstract Unix
+// socket has no filesystem pathname to replace; the extension accepts only
+// connections whose kernel peer credentials report uid 0. This keeps queue
+// reads and writes in this root-owned process and prevents same-user clients
+// from forging a verdict. Any bridge failure falls back to the existing GTK
+// presenter.
+function extensionAddress(uid, sessionId) {
+  return Gio.UnixSocketAddress.new_with_type(
+    `opencode-sudo-gate-${uid}-${sessionId}`,
+    Gio.UnixSocketAddressType.ABSTRACT,
+  );
+}
+
+function shellDisplayKey(reason) {
+  const env = reason.env && typeof reason.env === "object" ? reason.env : {};
+  const display = String(env.WAYLAND_DISPLAY || env.DISPLAY || "default");
+  return display.replace(/[^A-Za-z0-9_.-]/g, "_").slice(0, 64) || "default";
+}
+
+function trustedShellPeer(connection, expectedUid) {
+  try {
+    const credentials = connection.get_socket().get_credentials();
+    if (credentials.get_unix_user() !== Number(expectedUid)) return false;
+    const pid = credentials.get_unix_pid();
+    if (!pid || !GLib.file_test(`/proc/${pid}`, GLib.FileTest.IS_DIR)) return false;
+    const executable = GLib.file_read_link(`/proc/${pid}/exe`);
+    if (executable !== "/usr/bin/gnome-shell" && executable !== "/usr/lib/gnome-shell/gnome-shell")
+      return false;
+    const [, bytes] = Gio.File.new_for_path(`/proc/${pid}/cgroup`).load_contents(null);
+    const cgroup = new TextDecoder().decode(bytes);
+    // Shell must be running in its session-manager-owned user service, not a
+    // same-uid process that pre-bound the abstract socket before the extension.
+    if (!cgroup.includes(`/user-${expectedUid}.slice/`) ||
+      !/(?:^|\/)org\.gnome\.Shell@[^/]+\.service(?:\/|$)/m.test(cgroup))
+      return false;
+
+    // Confirm this PID is also the current owner of org.gnome.Shell on that
+    // user's session bus. This prevents a same-user process from pre-binding
+    // the abstract socket and merely imitating Shell's executable/cgroup.
+    const passwd = Gio.File.new_for_path("/etc/passwd").load_contents(null)[1];
+    const username = new TextDecoder().decode(passwd).split("\n")
+      .map((line) => line.split(":"))
+      .find((fields) => fields[2] === String(expectedUid))?.[0];
+    if (!username) return false;
+    const runuser = ["/usr/sbin/runuser", "/usr/bin/runuser"].find((path) =>
+      GLib.file_test(path, GLib.FileTest.IS_EXECUTABLE),
+    );
+    const gdbus = ["/usr/bin/gdbus", "/bin/gdbus"].find((path) =>
+      GLib.file_test(path, GLib.FileTest.IS_EXECUTABLE),
+    );
+    if (!runuser || !gdbus) return false;
+    const bus = `unix:path=/run/user/${expectedUid}/bus`;
+    const [ok, stdout, , status] = GLib.spawn_sync(null, [
+      runuser,
+      "-u", username,
+      "--",
+      gdbus,
+      "call",
+      "--timeout", "2",
+      "--address", bus,
+      "--dest", "org.freedesktop.DBus",
+      "--object-path", "/org/freedesktop/DBus",
+      "--method", "org.freedesktop.DBus.GetConnectionUnixProcessID",
+      "org.gnome.Shell",
+    ], null, GLib.SpawnFlags.SEARCH_PATH, null);
+    if (!ok || status !== 0) return false;
+    const owner = new TextDecoder().decode(stdout).match(/\(uint32\s+(\d+),\)/);
+    return owner !== null && Number(owner[1]) === pid;
+  } catch {
+    return false;
+  }
+}
+
+function sendJsonLine(output, value) {
+  const data = new TextEncoder().encode(`${JSON.stringify(value)}\n`);
+  const [ok] = output.write_all(data, null);
+  if (!ok) throw new Error("extension socket write failed");
+}
+
+function applyExtensionDecisions(message, shownAt) {
+  if (!message || message.type !== "decide" || !Array.isArray(message.decisions)) return;
+  if (GLib.get_monotonic_time() - shownAt < GRACE_MS * 1000) return;
+
+  for (const decision of message.decisions) {
+    if (!decision || typeof decision !== "object" || !XID_RE.test(decision.xid || "")) continue;
+    if (!["allowed", "denied"].includes(decision.status)) continue;
+    if (!["once", "session", "always"].includes(decision.scope)) continue;
+    const entry = readEntry(decision.xid);
+    if (!entry || entry.status !== "pending") continue;
+
+    const scope = decision.scope === "session" && !entry.session ? "once" : decision.scope;
+    entry.status = decision.status;
+    entry.rule = scope;
+    entry.why = decision.status === "allowed" ? "user allowed in GNOME Shell" : "user denied in GNOME Shell";
+    if (!writeEntry(entry)) continue;
+    if (scope === "always") appendRule(RULES_FILE, ruleFor(entry, decision.status));
+    if (scope === "session" && entry.session)
+      appendRule(sessionPath(entry.session), ruleFor(entry, decision.status));
+  }
+}
+
+function runExtensionPresenter(reason) {
+  const uid = GLib.getenv("SUDO_UID") || "";
+  if (!/^\d+$/.test(uid)) return false;
+
+  let connection;
+  try {
+    const client = new Gio.SocketClient();
+    client.set_timeout(1);
+    connection = client.connect(extensionAddress(uid, shellDisplayKey(reason)), null);
+    if (!trustedShellPeer(connection, uid)) {
+      connection.close(null);
+      return false;
+    }
+    connection.get_socket().set_timeout(1);
+  } catch {
+    return false;
+  }
+
+  const input = new Gio.DataInputStream({ base_stream: connection.get_input_stream() });
+  const output = connection.get_output_stream();
+  const shownAt = GLib.get_monotonic_time();
+  let emptyRounds = 0;
+  try {
+    for (;;) {
+      const pending = listEntries().filter((entry) => entry.status === "pending");
+      sendJsonLine(output, {
+        type: "update",
+        allowAfter: shownAt + GRACE_MS * 1000,
+        entries: pending.map((entry) => ({
+          xid: entry.xid,
+          text: entry.text,
+          purpose: entry.purpose,
+          cwd: entry.cwd,
+          session: entry.session,
+          ts: entry.ts,
+        })),
+      });
+
+      if (pending.length === 0) {
+        emptyRounds++;
+        if (emptyRounds >= 2) break;
+      } else {
+        emptyRounds = 0;
+      }
+
+      let lineBytes;
+      try {
+        [lineBytes] = input.read_line(null);
+      } catch (error) {
+        if (error.matches?.(Gio.io_error_quark(), Gio.IOErrorEnum.TIMED_OUT)) continue;
+        throw error;
+      }
+      if (lineBytes === null) throw new Error("extension disconnected");
+      const line = new TextDecoder().decode(lineBytes);
+      let message;
+      try {
+        message = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      applyExtensionDecisions(message, shownAt);
+    }
+    connection.close(null);
+    return true;
+  } catch {
+    try {
+      connection.close(null);
+    } catch {}
+    return false;
+  }
+}
+
 // Everything below uses stock Adwaita styling only — no custom CSS. One
 // shared PROVIDER_PRIORITY look: plain Adw window + headerbar, a boxed
 // list, and five standard footer buttons (destructive for Deny, suggested
@@ -757,6 +930,10 @@ function applyAccent(accent, dark) {
 
 function runPresenter() {
   const reason = readReason();
+  if (runExtensionPresenter(reason)) {
+    cleanupLock();
+    return 0;
+  }
   // Dedicated root-owned dconf profile (accent baked at install time).
   // Must precede ALL GTK/GSettings use — the backend is chosen on first
   // access, which happens inside Gtk.init_check() below.

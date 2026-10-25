@@ -10,6 +10,7 @@
     "src",
     "bin",
     "scripts",
+    "gnome-extension",
     "LICENSE",
     "README.md"
   ],
@@ -23,7 +24,9 @@
   "homepage": "https://github.com/uvindusl/opencode-sudo-popup#readme",
   "scripts": {
     "postinstall": "node scripts/install.js",
-    "install-system": "node scripts/install-system.js"
+    "install-system": "node scripts/install-system.js",
+    "install-extension": "node scripts/install-extension.js",
+    "pack-extension": "node scripts/pack-extension.js"
   },
   "keywords": [
     "opencode",
