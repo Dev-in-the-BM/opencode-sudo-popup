@@ -21,9 +21,9 @@ const LEGACY_ASKPASS = [
 const MARKER = "# added by opencode-sudo-popup"
 
 async function ensurePlugin() {
-  await mkdir(PLUGIN_DIR, { recursive: true })
   const src = join(__dirname, "..", "src", "index.js")
   const content = await readFile(src)
+  await mkdir(PLUGIN_DIR, { recursive: true })
   await writeFile(PLUGIN_DEST, content)
   // Drop the stale V1 copy (if any) so only the V2 plugin remains installed.
   await rm(LEGACY_PLUGIN_DEST, { force: true })

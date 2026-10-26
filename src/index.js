@@ -1,9 +1,8 @@
 import { writeFile, mkdir } from "node:fs/promises"
 import { execFile } from "node:child_process"
 
-// Where the askpass helper (installed by the postinstall script) lives.
-// SUDO_ASKPASS points here; this plugin only needs to know the shared
-// temp-file path to communicate with it.
+// Shared reason-file path: the plugin writes display context here for the
+// root-owned approval gate. The gate derives the command itself from argv.
 const REASON_FILE = "/tmp/opencode-sudo-reason"
 
 // A sudo invocation can be disguised as other words (e.g. the string
