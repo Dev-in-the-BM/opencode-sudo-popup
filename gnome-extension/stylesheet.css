@@ -34,9 +34,13 @@
   padding: 0;
 }
 
+.opencode-session-scroll {
+  width: 360px;
+  height: 360px;
+}
+
 .opencode-session-list {
   width: 360px;
-  max-height: 480px;
   spacing: 8px;
   padding: 0 8px 10px;
 }

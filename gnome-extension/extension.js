@@ -138,11 +138,19 @@ export default class OpenCodeSudoApprovalExtension extends Extension {
             can_focus: false,
             style_class: 'opencode-session-list-item',
         });
+        this._sessionScroll = new St.ScrollView({
+            style_class: 'opencode-session-scroll',
+            overlay_scrollbars: false,
+            x_expand: true,
+        });
+        this._sessionScroll.set_height(360);
+        this._sessionScroll.set_policy(St.PolicyType.NEVER, St.PolicyType.AUTOMATIC);
         this._list = new St.BoxLayout({
             vertical: true,
             style_class: 'opencode-session-list',
         });
-        this._listItem.add_child(this._list);
+        this._sessionScroll.set_child(this._list);
+        this._listItem.add_child(this._sessionScroll);
         menu.addMenuItem(this._listItem);
         this._renderSessions();
         this._selectTab('running');
