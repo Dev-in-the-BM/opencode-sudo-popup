@@ -445,8 +445,21 @@ export default class OpenCodeSudoApprovalExtension extends Extension {
 
     _makeSessionRow(session) {
         const row = new St.BoxLayout({
-            vertical: true,
+            vertical: false,
             style_class: 'opencode-session-row',
+            x_expand: true,
+            y_align: Clutter.ActorAlign.CENTER,
+        });
+        const icon = new St.Icon({
+            icon_name: session.running ? 'emblem-synchronizing-symbolic' : 'utilities-terminal-symbolic',
+            style_class: session.running
+                ? 'opencode-session-icon opencode-session-icon-running'
+                : 'opencode-session-icon',
+            y_align: Clutter.ActorAlign.CENTER,
+        });
+        const details = new St.BoxLayout({
+            vertical: true,
+            style_class: 'opencode-session-details',
             x_expand: true,
         });
         const title = new St.Label({
@@ -461,8 +474,10 @@ export default class OpenCodeSudoApprovalExtension extends Extension {
             x_expand: true,
         });
         directory.clutter_text.ellipsize = Pango.EllipsizeMode.MIDDLE;
-        row.add_child(title);
-        row.add_child(directory);
+        details.add_child(title);
+        details.add_child(directory);
+        row.add_child(icon);
+        row.add_child(details);
         return row;
     }
 

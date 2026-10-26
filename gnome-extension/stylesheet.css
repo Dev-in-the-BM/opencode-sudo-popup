@@ -1,16 +1,33 @@
 .opencode-session-tabs {
-  spacing: 4px;
-  padding: 4px 8px;
+  spacing: 0;
+  padding: 4px;
+  margin: 4px 8px 10px;
+  border-radius: 12px;
+  background-color: rgba(0, 0, 0, 0.28);
+  border: 1px solid rgba(255, 255, 255, 0.08);
 }
 
 .opencode-session-tab {
-  border-radius: 8px;
-  padding: 8px 10px;
+  border-radius: 9px;
+  padding: 9px 10px;
+  color: rgba(255, 255, 255, 0.68);
+  font-size: 0.95em;
 }
 
 .opencode-session-tab.selected {
-  background-color: rgba(255, 255, 255, 0.12);
+  background-color: #3584e4;
+  color: #ffffff;
   font-weight: bold;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.35);
+}
+
+.opencode-session-tab:hover {
+  background-color: rgba(255, 255, 255, 0.10);
+  color: #ffffff;
+}
+
+.opencode-session-tab.selected:hover {
+  background-color: #4a91e8;
 }
 
 .opencode-session-list-item {
@@ -20,21 +37,46 @@
 .opencode-session-list {
   width: 360px;
   max-height: 480px;
+  spacing: 8px;
+  padding: 0 8px 10px;
 }
 
 .opencode-session-row {
-  spacing: 3px;
-  padding: 9px 14px;
+  spacing: 12px;
+  padding: 12px 14px;
+  border-radius: 12px;
+  background-color: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.10);
+}
+
+.opencode-session-icon {
+  icon-size: 18px;
+  color: rgba(255, 255, 255, 0.60);
+}
+
+.opencode-session-icon-running {
+  color: #62a0ea;
+}
+
+.opencode-session-details {
+  spacing: 4px;
 }
 
 .opencode-session-title {
   font-weight: bold;
+  font-size: 1em;
+  color: #ffffff;
 }
 
 .opencode-session-directory,
 .opencode-session-empty {
-  color: #9a9996;
+  color: rgba(255, 255, 255, 0.62);
   font-size: 0.9em;
+}
+
+.opencode-session-empty {
+  padding: 18px 12px;
+  text-align: center;
 }
 
 .opencode-approval-list-item {
