@@ -65,6 +65,12 @@ npm run install-extension
 gnome-extensions enable opencode-sudo-popup@uvindusl.github.io
 ```
 
+Use **Manage permanent rules…** in the panel menu to open the extension
+Preferences. The manager lists always-allow and always-deny command patterns;
+adding or deleting a rule asks Polkit to run the narrowly scoped rule manager
+in the root-owned gate. The extension never writes the trusted rules file
+itself. Deny rules continue to take precedence over allow rules.
+
 To build an installable GNOME extension archive, run `npm run pack-extension`.
 
 The existing standalone dialog remains as the fail-closed fallback when the

@@ -435,6 +435,110 @@ function printRules() {
   for (const f of sessionFiles) print(formatRuleList("session rules", f, readRuleArray(f)));
 }
 
+function manageRules(args) {
+  const [operation, ...values] = args;
+  if (operation === "list" && values.length === 0) {
+    try {
+      const info = Gio.File.new_for_path(RULES_FILE).query_info(
+        "standard::type,standard::is-symlink,unix::uid",
+        Gio.FileQueryInfoFlags.NOFOLLOW_SYMLINKS,
+        null,
+      );
+      if (info.get_file_type() !== Gio.FileType.REGULAR || info.get_is_symlink() ||
+          info.get_attribute_uint32("unix::uid") !== 0)
+        throw new Error("rules file is not a root-owned regular file");
+      const raw = readTextFile(RULES_FILE);
+      const rules = raw === null ? null : parseJsonc(raw);
+      if (!Array.isArray(rules)) throw new Error("rules file is invalid");
+      print(JSON.stringify(rules));
+      return 0;
+    } catch (error) {
+      printerr(`opencode-sudo-gate: could not read rules: ${error.message}`);
+      return 1;
+    }
+  }
+
+  if (new Gio.Credentials().get_unix_user() !== 0) {
+    printerr("opencode-sudo-gate: rule changes require root");
+    return 1;
+  }
+  const pkexecUid = GLib.getenv("PKEXEC_UID") || "";
+  if (!/^\d+$/.test(pkexecUid) || GLib.getenv("SUDO_UID")) {
+    printerr("opencode-sudo-gate: rule changes must be authorized through Polkit");
+    return 1;
+  }
+
+  let rules;
+  try {
+    const raw = readTextFile(RULES_FILE);
+    const parsed = raw === null ? null : parseJsonc(raw);
+    if (!Array.isArray(parsed)) throw new Error("rules file is missing or invalid; refusing to overwrite it");
+    rules = parsed;
+  } catch (error) {
+    printerr(`opencode-sudo-gate: ${error.message}`);
+    return 1;
+  }
+  if (operation === "add" && values.length === 2) {
+    const [effect, resource] = values;
+    if (!["allow", "deny"].includes(effect) ||
+        typeof resource !== "string" || resource.length > 512 ||
+        !resource.startsWith("sudo ") || /[\u0000-\u001f\u007f]/.test(resource)) {
+      printerr("opencode-sudo-gate: invalid rule; expected allow|deny and a command pattern beginning with 'sudo '");
+      return 2;
+    }
+    if (rules.some((rule) => rule && rule.action === "shell" &&
+        rule.effect === effect && rule.resource === resource)) {
+      printerr("opencode-sudo-gate: rule already exists");
+      return 1;
+    }
+    rules.push({ action: "shell", resource, effect });
+  } else if (operation === "delete" && values.length === 2) {
+    const index = Number(values[0]);
+    const expectedResource = values[1];
+    if (!Number.isSafeInteger(index) || index < 0 || index >= rules.length ||
+        !rules[index] || rules[index].resource !== expectedResource ||
+        !["allow", "deny"].includes(rules[index].effect)) {
+      printerr("opencode-sudo-gate: rule list changed; refresh and try again");
+      return 1;
+    }
+    rules.splice(index, 1);
+  } else {
+    printerr("usage: opencode-sudo-gate --manage-rules list|add <allow|deny> <pattern>|delete <index> <pattern>");
+    return 2;
+  }
+
+  try {
+    const directory = Gio.File.new_for_path(ETC_DIR);
+    const directoryInfo = directory.query_info(
+      "standard::type,standard::is-symlink,unix::uid",
+      Gio.FileQueryInfoFlags.NOFOLLOW_SYMLINKS,
+      null,
+    );
+    if (directoryInfo.get_file_type() !== Gio.FileType.DIRECTORY ||
+        directoryInfo.get_is_symlink() || directoryInfo.get_attribute_uint32("unix::uid") !== 0)
+      throw new Error("rules directory is not a root-owned directory");
+
+    const file = Gio.File.new_for_path(RULES_FILE);
+    if (file.query_exists(null)) {
+      const info = file.query_info(
+        "standard::type,standard::is-symlink,unix::uid",
+        Gio.FileQueryInfoFlags.NOFOLLOW_SYMLINKS,
+        null,
+      );
+      if (info.get_file_type() !== Gio.FileType.REGULAR || info.get_is_symlink() ||
+          info.get_attribute_uint32("unix::uid") !== 0)
+        throw new Error("rules file is not a root-owned regular file");
+    }
+    GLib.file_set_contents(RULES_FILE, `${JSON.stringify(rules, null, 2)}\n`);
+    GLib.chmod(RULES_FILE, 0o644);
+    print(JSON.stringify(rules));
+    return 0;
+  } catch (error) {
+    printerr(`opencode-sudo-gate: could not update rules: ${error.message}`);
+    return 1;
+  }
+}
+
 function printRulesCheck(cmd) {
   const reason = readReason();
   const opts = { cwd: GLib.get_current_dir(), home: homeOf(reason), session: sessionKeyOf(reason) };
@@ -1429,6 +1533,7 @@ function main() {
     printRules();
     return 0;
   }
+  if (args[0] === "--manage-rules") return manageRules(args.slice(1));
   if (args[0] === "--rules-check") {
     printRulesCheck(args.slice(1).join(" ").trim());
     return 0;

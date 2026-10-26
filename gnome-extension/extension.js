@@ -113,6 +113,10 @@ export default class OpenCodeSudoApprovalExtension extends Extension {
         actions.add_child(actionRow);
         menu.addMenuItem(actions);
 
+        const manageRules = new PopupMenu.PopupMenuItem('Manage permanent rules…');
+        manageRules.connect('activate', () => this.openPreferences());
+        menu.addMenuItem(manageRules);
+
         const tabs = new St.BoxLayout({
             style_class: 'opencode-session-tabs',
             x_expand: true,
